@@ -1,0 +1,97 @@
+// raykv — a RESP2 key-value server redis-cli can talk to.
+import std/io;
+import store;
+import server;
+
+const DEFAULT_PORT: int = 7379;
+
+fn usage() {
+    eprint("usage: raykv [--bind H] [--port N] [--dir DIR] [--no-aof]");
+    eprint("");
+    eprint("  RESP2 server (redis-cli / redis-benchmark compatible subset):");
+    eprint("  PING ECHO SET(EX/PX/NX/XX) GET DEL EXISTS INCR/DECR/INCRBY");
+    eprint("  EXPIRE/PEXPIRE/TTL/PTTL TYPE KEYS DBSIZE FLUSHALL SUBSCRIBE/PUBLISH");
+    eprint("  default port " + to_string(DEFAULT_PORT) + "; AOF in DIR (default ./raykv-data)");
+}
+
+fn flag_value(av: [string], name: string) -> Option<string> {
+    var i = 0;
+    while (i + 1 < av.len()) {
+        if (av[i] == name) {
+            return Option.Some(av[i + 1]);
+        }
+        i = i + 1;
+    }
+    Option.None
+}
+
+fn flag_int(av: [string], name: string, fallback: int) -> int {
+    match (flag_value(av, name)) {
+        Option.Some(s) => {
+            match (parse_int(s)) {
+                Option.Some(n) => n,
+                Option.None => fallback,
+            }
+        },
+        Option.None => fallback,
+    }
+}
+
+fn flag_str(av: [string], name: string, fallback: string) -> string {
+    match (flag_value(av, name)) {
+        Option.Some(s) => s,
+        Option.None => fallback,
+    }
+}
+
+fn has_flag(av: [string], name: string) -> bool {
+    for a in av {
+        if (a == name) {
+            return true;
+        }
+    }
+    false
+}
+
+fn main() -> int {
+    let av = args();
+    if (has_flag(av, "--help") || has_flag(av, "-h")) {
+        usage();
+        return 0;
+    }
+    let persist = !has_flag(av, "--no-aof");
+    match (store.start(
+    flag_str(av, "--dir", "./raykv-data"),
+    persist
+)) {
+        Result.Err(e) => {
+            eprint("raykv: " + e);
+            1
+        },
+        Result.Ok(sv) => {
+            let port = flag_int(av, "--port", DEFAULT_PORT);
+            match (server.start(
+            flag_str(av, "--bind", "127.0.0.1"),
+            port,
+            sv
+        )) {
+                Result.Err(e) => {
+                    eprint("raykv: " + e);
+                    1
+                },
+                Result.Ok(actual) => {
+                    eprint(
+                        "raykv listening on port " + to_string(actual) + if (persist) { " (aof on)" } else { " (aof off)" }
+                    );
+                    match (recv(signals())) {
+                        Option.Some(sig) => {
+                            eprint("raykv: shutting down (signal " + to_string(sig) + ")");
+                        },
+                        Option.None => { },
+                    }
+                    0
+                },
+            }
+        },
+    }
+}

@@ -1,0 +1,554 @@
+// raykv — the keyspace actor: sole owner of the data, the expiries, the
+// pub/sub subscribers and the AOF handle.
+//
+// Writes append a LOGICAL command to the AOF before mutating memory: INCR
+// becomes the SET of its result, SET-with-TTL becomes SET + PEXPIREAT with an
+// absolute epoch-ms deadline (so TTLs survive a restart on the wall clock).
+import std/time;
+import std/fs;
+import resp;
+import aof;
+
+struct Entry {
+    value: bytes,
+    expires_at: int,
+}
+
+pub enum Sv {
+    Cmd([bytes], Channel<bytes>),
+    Subscribe(int, string, Channel<bytes>, Channel<bytes>),
+    Unsubscribe(int, string, Channel<bytes>),
+    Gone(int),
+    Tick,
+}
+
+struct Subscriber {
+    conn_id: int,
+    out: Channel<bytes>,
+}
+
+struct Store {
+    data: Map<string, Entry>,
+    subs: Map<string, [Subscriber]>,
+    log: aof.Aof,
+    persist: bool,
+}
+
+pub fn start(dir: string, persist: bool) -> Result<Channel<Sv>, string> {
+    let ch: Channel<Sv> = Channel.bounded(1024);
+    var data: Map<string, Entry> = Map.new();
+    var subs: Map<string, [Subscriber]> = Map.new();
+    if (persist && !fs.exists(dir)) {
+        fs.mkdir(dir)?;
+    }
+    let path = dir + "/raykv.aof";
+    var log = aof.disabled();
+    if (persist) {
+        let replayed = aof.replay(path);
+        for cmd in replayed {
+            apply_only(data, cmd);
+        }
+        log = aof.rewrite_and_open(path, dump_commands(data))?;
+    }
+    let st = Store { data: data, subs: subs, log: log, persist: persist };
+    spawn(fn() {
+        actor_loop(ch, st);
+    });
+    spawn(fn() {
+        while (true) {
+            time.sleep(250);
+            send(ch, Sv.Tick);
+        }
+    });
+    Result.Ok(ch)
+}
+
+fn now_ms() -> int {
+    time.now()
+}
+
+fn dump_commands(data: Map<string, Entry>) -> [[bytes]] {
+    var out: [[bytes]] = [];
+    let t = now_ms();
+    for k in data.keys() {
+        match (get(data, k)) {
+            Option.Some(e) => {
+                if (e.expires_at == 0 || e.expires_at > t) {
+                    out.push(["SET".to_bytes(), k.to_bytes(), e.value]);
+                    if (e.expires_at > 0) {
+                        out.push(
+                            [
+                                "PEXPIREAT".to_bytes(),
+                                k.to_bytes(),
+                                to_string(e.expires_at).to_bytes()
+                            ]
+                        );
+                    }
+                }
+            },
+            Option.None => { },
+        }
+    }
+    out
+}
+
+fn arg_str(args: [bytes], i: int) -> string {
+    match (from_utf8(args[i])) {
+        Result.Ok(s) => s,
+        Result.Err(e) => "",
+    }
+}
+
+fn arg_int(args: [bytes], i: int) -> Option<int> {
+    parse_int(arg_str(args, i))
+}
+
+// Replay path: apply a logical command to the map, no AOF, no replies.
+fn apply_only(data: Map<string, Entry>, args: [bytes]) {
+    if (args.len() == 0) {
+        return;
+    }
+    let cmd = arg_str(args, 0).to_upper();
+    if (cmd == "SET" && args.len() >= 3) {
+        data.insert(arg_str(args, 1), Entry { value: args[2], expires_at: 0 });
+    } else if (cmd == "PEXPIREAT" && args.len() >= 3) {
+        let k = arg_str(args, 1);
+        match (get(data, k)) {
+            Option.Some(e) => {
+                match (arg_int(args, 2)) {
+                    Option.Some(at) => {
+                        data.insert(k, Entry { value: e.value, expires_at: at });
+                    },
+                    Option.None => { },
+                }
+            },
+            Option.None => { },
+        }
+    } else if (cmd == "DEL") {
+        var i = 1;
+        while (i < args.len()) {
+            data.remove(arg_str(args, i));
+            i = i + 1;
+        }
+    } else if (cmd == "FLUSHALL") {
+        for k in data.keys() {
+            data.remove(k);
+        }
+    }
+}
+
+// Live read with lazy expiry.
+fn live(st: Store, k: string) -> Option<Entry> {
+    match (get(st.data, k)) {
+        Option.Some(e) => {
+            if (e.expires_at > 0 && e.expires_at <= now_ms()) {
+                st.data.remove(k);
+                if (st.persist) {
+                    aof.append(st.log, ["DEL".to_bytes(), k.to_bytes()]);
+                }
+                return Option.None;
+            }
+            Option.Some(e)
+        },
+        Option.None => Option.None,
+    }
+}
+
+fn log_set(st: Store, k: string, v: bytes, expires_at: int) {
+    if (!st.persist) {
+        return;
+    }
+    aof.append(st.log, ["SET".to_bytes(), k.to_bytes(), v]);
+    if (expires_at > 0) {
+        aof.append(
+            st.log,
+            ["PEXPIREAT".to_bytes(), k.to_bytes(), to_string(expires_at).to_bytes()]
+        );
+    }
+}
+
+fn glob_match(pattern: string, s: string) -> bool {
+    glob_at(pattern.chars(), 0, s.chars(), 0)
+}
+
+fn glob_at(p: [char], pi: int, s: [char], si: int) -> bool {
+    if (pi >= p.len()) {
+        return si >= s.len();
+    }
+    let c = p[pi];
+    if (c == '*') {
+        var k = si;
+        while (k <= s.len()) {
+            if (glob_at(p, pi + 1, s, k)) {
+                return true;
+            }
+            k = k + 1;
+        }
+        false
+    } else if (c == '?') {
+        si < s.len() && glob_at(p, pi + 1, s, si + 1)
+    } else {
+        si < s.len() && s[si] == c && glob_at(p, pi + 1, s, si + 1)
+    }
+}
+
+fn set_cmd(st: Store, args: [bytes]) -> bytes {
+    if (args.len() < 3) {
+        return resp.error("wrong number of arguments for 'set' command");
+    }
+    let k = arg_str(args, 1);
+    var expires_at = 0;
+    var nx = false;
+    var xx = false;
+    var i = 3;
+    while (i < args.len()) {
+        let opt = arg_str(args, i).to_upper();
+        if (opt == "EX" && i + 1 < args.len()) {
+            match (arg_int(args, i + 1)) {
+                Option.Some(secs) => {
+                    expires_at = now_ms() + secs * 1000;
+                },
+                Option.None => {
+                    return resp.error("value is not an integer or out of range");
+                },
+            }
+            i = i + 2;
+        } else if (opt == "PX" && i + 1 < args.len()) {
+            match (arg_int(args, i + 1)) {
+                Option.Some(ms) => {
+                    expires_at = now_ms() + ms;
+                },
+                Option.None => {
+                    return resp.error("value is not an integer or out of range");
+                },
+            }
+            i = i + 2;
+        } else if (opt == "NX") {
+            nx = true;
+            i = i + 1;
+        } else if (opt == "XX") {
+            xx = true;
+            i = i + 1;
+        } else {
+            return resp.error("syntax error");
+        }
+    }
+    let exists = match (live(st, k)) {
+        Option.Some(e) => true,
+        Option.None => false,
+    };
+    if (nx && exists || xx && !exists) {
+        return resp.nil();
+    }
+    st.data.insert(k, Entry { value: args[2], expires_at: expires_at });
+    log_set(st, k, args[2], expires_at);
+    resp.simple("OK")
+}
+
+fn incr_by(st: Store, k: string, delta: int) -> bytes {
+    var cur = 0;
+    var expires_at = 0;
+    match (live(st, k)) {
+        Option.Some(e) => {
+            match (from_utf8(e.value)) {
+                Result.Ok(s) => {
+                    match (parse_int(s)) {
+                        Option.Some(n) => {
+                            cur = n;
+                            expires_at = e.expires_at;
+                        },
+                        Option.None => {
+                            return resp.error("value is not an integer or out of range");
+                        },
+                    }
+                },
+                Result.Err(e2) => {
+                    return resp.error("value is not an integer or out of range");
+                },
+            }
+        },
+        Option.None => { },
+    }
+    let next = cur + delta;
+    let v = to_string(next).to_bytes();
+    st.data.insert(k, Entry { value: v, expires_at: expires_at });
+    log_set(st, k, v, expires_at);
+    resp.integer(next)
+}
+
+fn expire_cmd(st: Store, args: [bytes], unit_ms: int, absolute: bool) -> bytes {
+    if (args.len() < 3) {
+        return resp.error("wrong number of arguments");
+    }
+    let k = arg_str(args, 1);
+    match (arg_int(args, 2)) {
+        Option.None => resp.error("value is not an integer or out of range"),
+        Option.Some(n) => {
+            match (live(st, k)) {
+                Option.None => resp.integer(0),
+                Option.Some(e) => {
+                    let at = if (absolute) { n } else { now_ms() + n * unit_ms };
+                    st.data.insert(k, Entry { value: e.value, expires_at: at });
+                    if (st.persist) {
+                        aof.append(
+                            st.log,
+                            ["PEXPIREAT".to_bytes(), k.to_bytes(), to_string(at).to_bytes()]
+                        );
+                    }
+                    resp.integer(1)
+                },
+            }
+        },
+    }
+}
+
+// The pub/sub push frame: *3 message <channel> <payload>.
+fn push_frame(channel: string, payload: bytes) -> bytes {
+    resp.array_header(3) + resp.bulk_str("message") + resp.bulk_str(channel) + resp.bulk(payload)
+}
+
+fn publish(st: Store, channel: string, payload: bytes) -> int {
+    match (get(st.subs, channel)) {
+        Option.None => 0,
+        Option.Some(list) => {
+            let frame = push_frame(channel, payload);
+            for s in list {
+                send(s.out, frame);
+            }
+            list.len()
+        },
+    }
+}
+
+fn drop_conn(st: Store, conn_id: int) {
+    for ch in st.subs.keys() {
+        match (get(st.subs, ch)) {
+            Option.Some(list) => {
+                var keep: [Subscriber] = [];
+                for s in list {
+                    if (s.conn_id != conn_id) {
+                        keep.push(s);
+                    }
+                }
+                if (keep.len() == 0) {
+                    st.subs.remove(ch);
+                } else {
+                    st.subs.insert(ch, keep);
+                }
+            },
+            Option.None => { },
+        }
+    }
+}
+
+pub fn execute(st: Store, args: [bytes]) -> bytes {
+    if (args.len() == 0) {
+        return resp.error("empty command");
+    }
+    let cmd = arg_str(args, 0).to_upper();
+    if (cmd == "PING") {
+        if (args.len() > 1) { resp.bulk(args[1]) } else { resp.simple("PONG") }
+    } else if (cmd == "ECHO" && args.len() >= 2) {
+        resp.bulk(args[1])
+    } else if (cmd == "SET") {
+        set_cmd(st, args)
+    } else if (cmd == "GET") {
+        if (args.len() < 2) {
+            return resp.error("wrong number of arguments for 'get' command");
+        }
+        match (live(st, arg_str(args, 1))) {
+            Option.Some(e) => resp.bulk(e.value),
+            Option.None => resp.nil(),
+        }
+    } else if (cmd == "DEL" || cmd == "UNLINK") {
+        var n = 0;
+        var i = 1;
+        while (i < args.len()) {
+            let k = arg_str(args, i);
+            match (live(st, k)) {
+                Option.Some(e) => {
+                    st.data.remove(k);
+                    n = n + 1;
+                    if (st.persist) {
+                        aof.append(st.log, ["DEL".to_bytes(), k.to_bytes()]);
+                    }
+                },
+                Option.None => { },
+            }
+            i = i + 1;
+        }
+        resp.integer(n)
+    } else if (cmd == "EXISTS") {
+        var n = 0;
+        var i = 1;
+        while (i < args.len()) {
+            match (live(st, arg_str(args, i))) {
+                Option.Some(e) => {
+                    n = n + 1;
+                },
+                Option.None => { },
+            }
+            i = i + 1;
+        }
+        resp.integer(n)
+    } else if (cmd == "INCR" && args.len() >= 2) {
+        incr_by(st, arg_str(args, 1), 1)
+    } else if (cmd == "DECR" && args.len() >= 2) {
+        incr_by(st, arg_str(args, 1), 0 - 1)
+    } else if (cmd == "INCRBY" && args.len() >= 3) {
+        match (arg_int(args, 2)) {
+            Option.Some(d) => incr_by(st, arg_str(args, 1), d),
+            Option.None => resp.error("value is not an integer or out of range"),
+        }
+    } else if (cmd == "EXPIRE") {
+        expire_cmd(st, args, 1000, false)
+    } else if (cmd == "PEXPIRE") {
+        expire_cmd(st, args, 1, false)
+    } else if (cmd == "PEXPIREAT") {
+        expire_cmd(st, args, 1, true)
+    } else if (cmd == "TTL" || cmd == "PTTL") {
+        if (args.len() < 2) {
+            return resp.error("wrong number of arguments");
+        }
+        match (live(st, arg_str(args, 1))) {
+            Option.None => resp.integer(0 - 2),
+            Option.Some(e) => {
+                if (e.expires_at == 0) {
+                    resp.integer(0 - 1)
+                } else {
+                    let left = e.expires_at - now_ms();
+                    if (cmd == "TTL") { resp.integer((left + 999) / 1000) } else {
+                        resp.integer(left)
+                    }
+                }
+            },
+        }
+    } else if (cmd == "TYPE" && args.len() >= 2) {
+        match (live(st, arg_str(args, 1))) {
+            Option.Some(e) => resp.simple("string"),
+            Option.None => resp.simple("none"),
+        }
+    } else if (cmd == "KEYS" && args.len() >= 2) {
+        let pattern = arg_str(args, 1);
+        var hits: [bytes] = [];
+        let t = now_ms();
+        for k in st.data.keys() {
+            match (get(st.data, k)) {
+                Option.Some(e) => {
+                    if ((e.expires_at == 0 || e.expires_at > t) && glob_match(pattern, k)) {
+                        hits.push(k.to_bytes());
+                    }
+                },
+                Option.None => { },
+            }
+        }
+        resp.array_of(hits)
+    } else if (cmd == "DBSIZE") {
+        resp.integer(st.data.keys().len())
+    } else if (cmd == "FLUSHALL" || cmd == "FLUSHDB") {
+        for k in st.data.keys() {
+            st.data.remove(k);
+        }
+        if (st.persist) {
+            aof.append(st.log, ["FLUSHALL".to_bytes()]);
+        }
+        resp.simple("OK")
+    } else if (cmd == "PUBLISH" && args.len() >= 3) {
+        resp.integer(publish(st, arg_str(args, 1), args[2]))
+    } else if (cmd == "COMMAND" || cmd == "CONFIG" || cmd == "CLIENT" || cmd == "INFO" || cmd == "HELLO") {
+        // Handshake noise from redis-cli/redis-benchmark: answer benignly.
+        if (cmd == "INFO") {
+            resp.bulk_str("# Server\r\nredis_version:7.0.0-raykv\r\n")
+        } else if (cmd == "HELLO") {
+            resp.error("unknown command 'HELLO'")
+        } else if (cmd == "CONFIG") {
+            resp.array_header(0)
+        } else {
+            resp.array_header(0)
+        }
+    } else {
+        resp.error("unknown command '" + cmd + "'")
+    }
+}
+
+fn sweep(st: Store) {
+    let t = now_ms();
+    var doomed: [string] = [];
+    for k in st.data.keys() {
+        match (get(st.data, k)) {
+            Option.Some(e) => {
+                if (e.expires_at > 0 && e.expires_at <= t) {
+                    doomed.push(k);
+                }
+            },
+            Option.None => { },
+        }
+    }
+    for k in doomed {
+        st.data.remove(k);
+        if (st.persist) {
+            aof.append(st.log, ["DEL".to_bytes(), k.to_bytes()]);
+        }
+    }
+}
+
+fn actor_loop(ch: Channel<Sv>, st: Store) {
+    var running = true;
+    while (running) {
+        match (recv(
+    ch
+)) {
+            Option.None => {
+                running = false;
+            },
+            Option.Some(msg) => {
+                match (msg) {
+                    Sv.Cmd(args, reply) => {
+                        send(reply, execute(st, args));
+                    },
+                    Sv.Subscribe(conn_id, channel, out, reply) => {
+                        var fresh: [Subscriber] = [];
+                        var list = match (get(st.subs, channel)) {
+                            Option.Some(l) => l,
+                            Option.None => fresh,
+                        };
+                        list.push(Subscriber { conn_id: conn_id, out: out });
+                        st.subs.insert(channel, list);
+                        send(
+                            reply,
+                            resp.array_header(3) + resp.bulk_str("subscribe") + resp.bulk_str(channel) + resp.integer(1)
+                        );
+                    },
+                    Sv.Unsubscribe(conn_id, channel, reply) => {
+                        match (get(st.subs, channel)) {
+                            Option.Some(list) => {
+                                var keep: [Subscriber] = [];
+                                for s in list {
+                                    if (s.conn_id != conn_id) {
+                                        keep.push(s);
+                                    }
+                                }
+                                if (keep.len() == 0) {
+                                    st.subs.remove(channel);
+                                } else {
+                                    st.subs.insert(channel, keep);
+                                }
+                            },
+                            Option.None => { },
+                        }
+                        send(
+                            reply,
+                            resp.array_header(3) + resp.bulk_str("unsubscribe") + resp.bulk_str(channel) + resp.integer(0)
+                        );
+                    },
+                    Sv.Gone(conn_id) => {
+                        drop_conn(st, conn_id);
+                    },
+                    Sv.Tick => {
+                        sweep(st);
+                    },
+                }
+            },
+        }
+    }
+}

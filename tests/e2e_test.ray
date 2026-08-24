@@ -1,0 +1,85 @@
+// End-to-end through net/redis (the compat target besides redis-cli): data
+// commands, expiry, and AOF durability across a broker restart. One @test
+// (the runner leaves zombie listeners between tests).
+import std/fs;
+import std/time;
+import net/redis;
+import store;
+import server;
+
+const DIR: string = "/tmp/raykv_e2e_data";
+
+fn wipe() {
+    if (fs.exists(DIR)) {
+        match (fs.list_dir(DIR)) {
+            Result.Ok(names) => {
+                for f in names {
+                    fs.remove_file(DIR + "/" + f);
+                }
+            },
+            Result.Err(e) => { },
+        }
+    }
+}
+
+fn boot(port: int) {
+    let sv = match (store.start(DIR, true)) {
+        Result.Ok(s) => s,
+        Result.Err(e) => panic(e),
+    };
+    match (server.start("127.0.0.1", port, sv)) {
+        Result.Ok(p) => { },
+        Result.Err(e) => panic(e),
+    }
+    time.sleep(100);
+}
+
+fn conn(port: int) -> redis.Conn {
+    match (redis.connect("127.0.0.1", port)) {
+        Result.Ok(c) => c,
+        Result.Err(e) => panic(e),
+    }
+}
+
+fn cmd(c: redis.Conn, args: [string]) -> string {
+    match (redis.command(c, args)) {
+        Result.Ok(r) => redis.reply_str(r),
+        Result.Err(e) => panic(join(args, " ") + ": " + e),
+    }
+}
+
+@test
+fn raykv_end_to_end() {
+    wipe();
+    boot(18981);
+    let c = conn(18981);
+    assert_eq(cmd(c, ["PING"]), "PONG");
+    assert_eq(cmd(c, ["SET", "saludo", "hola"]), "OK");
+    assert_eq(cmd(c, ["GET", "saludo"]), "hola");
+    assert_eq(cmd(c, ["GET", "nada"]), "(nil)");
+    assert_eq(cmd(c, ["INCR", "visitas"]), "1");
+    assert_eq(cmd(c, ["INCRBY", "visitas", "10"]), "11");
+    assert_eq(cmd(c, ["INCR", "saludo"]), "(error) ERR value is not an integer or out of range");
+    assert_eq(cmd(c, ["SET", "fugaz", "x", "PX", "150"]), "OK");
+    assert_eq(cmd(c, ["EXISTS", "fugaz", "saludo", "nada"]), "2");
+    time.sleep(250);
+    assert_eq(cmd(c, ["GET", "fugaz"]), "(nil)");
+    assert_eq(cmd(c, ["SET", "nx1", "a", "NX"]), "OK");
+    assert_eq(cmd(c, ["SET", "nx1", "b", "NX"]), "(nil)");
+    assert_eq(cmd(c, ["GET", "nx1"]), "a");
+    assert_eq(cmd(c, ["TTL", "saludo"]), "-1");
+    assert_eq(cmd(c, ["TTL", "no-such"]), "-2");
+    assert_eq(cmd(c, ["DEL", "nx1", "no-such"]), "1");
+    assert_eq(cmd(c, ["KEYS", "salu*"]), "[saludo]");
+    assert_eq(cmd(c, ["TYPE", "saludo"]), "string");
+    redis.close_conn(c);
+
+    // Durability: a second store over the same dir (fresh port) sees the data.
+    boot(18982);
+    let c2 = conn(18982);
+    assert_eq(cmd(c2, ["GET", "saludo"]), "hola");
+    assert_eq(cmd(c2, ["GET", "visitas"]), "11");
+    assert_eq(cmd(c2, ["GET", "fugaz"]), "(nil)");
+    assert_eq(cmd(c2, ["DBSIZE"]), "2");
+    redis.close_conn(c2);
+}

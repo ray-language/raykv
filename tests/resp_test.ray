@@ -1,0 +1,106 @@
+// The incremental RESP2 parser: whole frames, torn frames, inline commands.
+import resp;
+
+fn expect_cmd(buf: bytes, want: [string], want_used: int) {
+    match (resp.parse(buf)) {
+        resp.Parsed.Cmd(args, used) => {
+            assert_eq(args.len(), want.len());
+            var i = 0;
+            while (i < want.len()) {
+                match (from_utf8(args[i])) {
+                    Result.Ok(s) => assert_eq(s, want[i]),
+                    Result.Err(e) => panic(e),
+                }
+                i = i + 1;
+            }
+            assert_eq(used, want_used);
+        },
+        resp.Parsed.NeedMore => panic("unexpected NeedMore"),
+        resp.Parsed.Bad(e) => panic("unexpected Bad: " + e),
+    }
+}
+
+fn expect_need_more(buf: bytes) {
+    match (resp.parse(buf)) {
+        resp.Parsed.NeedMore => { },
+        resp.Parsed.Cmd(a, u) => panic("expected NeedMore, got a command"),
+        resp.Parsed.Bad(e) => panic("expected NeedMore, got Bad: " + e),
+    }
+}
+
+@test
+fn parses_a_full_multibulk() {
+    let wire = "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n".to_bytes();
+    expect_cmd(wire, ["SET", "foo", "bar"], wire.len());
+}
+
+@test
+fn torn_frames_ask_for_more() {
+    let wire = "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n".to_bytes();
+    var i = 1;
+    while (i < wire.len()) {
+        expect_need_more(wire.sub_bytes(0, i));
+        i = i + 3;
+    }
+}
+
+@test
+fn two_pipelined_commands_come_out_one_at_a_time() {
+    let wire = "*1\r\n$4\r\nPING\r\n*2\r\n$3\r\nGET\r\n$1\r\nk\r\n".to_bytes();
+    match (resp.parse(wire)) {
+        resp.Parsed.Cmd(args, used) => {
+            assert_eq(args.len(), 1);
+            let rest = wire.sub_bytes(used, wire.len());
+            expect_cmd(rest, ["GET", "k"], rest.len());
+        },
+        _ => panic("expected first command"),
+    }
+}
+
+@test
+fn inline_commands_work() {
+    expect_cmd("PING\r\n".to_bytes(), ["PING"], 6);
+    expect_cmd("SET a b\r\n".to_bytes(), ["SET", "a", "b"], 9);
+}
+
+@test
+fn binary_safe_values() {
+    let payload = b"\x00\x01\xff";
+    let wire = "*2\r\n$4\r\nECHO\r\n$3\r\n".to_bytes() + payload + "\r\n".to_bytes();
+    match (resp.parse(wire)) {
+        resp.Parsed.Cmd(args, used) => {
+            assert_eq(args[1].len(), 3);
+            assert_eq(args[1][0], 0);
+            assert_eq(args[1][2], 255);
+        },
+        _ => panic("expected a command"),
+    }
+}
+
+@test
+fn garbage_is_bad_not_a_hang() {
+    match (resp.parse("*x\r\n".to_bytes())) {
+        resp.Parsed.Bad(e) => { },
+        _ => panic("expected Bad"),
+    }
+}
+
+@test
+fn encoders_round() {
+    match (from_utf8(resp.simple("OK"))) {
+        Result.Ok(s) => assert_eq(s, "+OK\r\n"),
+        Result.Err(e) => panic(e),
+    }
+    match (from_utf8(resp.integer(0 - 1))) {
+        Result.Ok(s) => assert_eq(s, ":-1\r\n"),
+        Result.Err(e) => panic(e),
+    }
+    match (from_utf8(resp.bulk_str("ab"))) {
+        Result.Ok(s) => assert_eq(s, "$2\r\nab\r\n"),
+        Result.Err(e) => panic(e),
+    }
+    match (from_utf8(resp.nil())) {
+        Result.Ok(s) => assert_eq(s, "$-1\r\n"),
+        Result.Err(e) => panic(e),
+    }
+}

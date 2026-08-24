@@ -1,0 +1,170 @@
+// raykv — RESP2: an incremental, binary-safe parser and the reply encoders.
+//
+// The parser consumes from a growing byte buffer and yields one command
+// (array of bulk strings, each raw bytes) per call — or NeedMore when the
+// frame is torn across TCP chunks. Inline commands ("PING\r\n", what a bare
+// telnet/redis-cli sends before RESP) are supported too.
+
+pub enum Parsed {
+    Cmd([bytes], int),
+    NeedMore,
+    Bad(string),
+}
+
+fn find_crlf(buf: bytes, start: int) -> Option<int> {
+    var i = start;
+    while (i + 1 < buf.len()) {
+        if (buf[i] == 13 && buf[i + 1] == 10) {
+            return Option.Some(i);
+        }
+        i = i + 1;
+    }
+    Option.None
+}
+
+fn parse_int_bytes(buf: bytes, start: int, end: int) -> Option<int> {
+    var v = 0;
+    var i = start;
+    var neg = false;
+    if (i < end && buf[i] == 45) {
+        neg = true;
+        i = i + 1;
+    }
+    if (i >= end) {
+        return Option.None;
+    }
+    while (i < end) {
+        let d = buf[i];
+        if (d < 48 || d > 57) {
+            return Option.None;
+        }
+        v = v * 10 + (d - 48);
+        i = i + 1;
+    }
+    if (neg) { Option.Some(0 - v) } else { Option.Some(v) }
+}
+
+// One command from buf[0..): Cmd(args, consumed) | NeedMore | Bad.
+pub fn parse(buf: bytes) -> Parsed {
+    if (buf.len() == 0) {
+        return Parsed.NeedMore;
+    }
+    if (buf[0] != 42) {
+        // Inline command: a single line, split on spaces.
+        match (find_crlf(buf, 0)) {
+            Option.None => {
+                if (buf.len() > 65536) {
+                    return Parsed.Bad("inline command too long");
+                }
+                Parsed.NeedMore
+            },
+            Option.Some(e) => {
+                match (from_utf8(buf.sub_bytes(0, e))) {
+                    Result.Err(err) => Parsed.Bad("invalid inline command"),
+                    Result.Ok(line) => {
+                        var out: [bytes] = [];
+                        for part in line.split(" ") {
+                            if (part.trim() != "") {
+                                out.push(part.trim().to_bytes());
+                            }
+                        }
+                        Parsed.Cmd(out, e + 2)
+                    },
+                }
+            },
+        }
+    } else {
+        let head_end = match (find_crlf(buf, 1)) {
+            Option.Some(e) => e,
+            Option.None => {
+                return Parsed.NeedMore;
+            },
+        };
+        let n = match (parse_int_bytes(buf, 1, head_end)) {
+            Option.Some(v) => v,
+            Option.None => {
+                return Parsed.Bad("invalid multibulk length");
+            },
+        };
+        if (n < 0 || n > 1024) {
+            return Parsed.Bad("invalid multibulk length");
+        }
+        var pos = head_end + 2;
+        var out: [bytes] = [];
+        var i = 0;
+        while (i < n) {
+            if (pos >= buf.len() || buf[pos] != 36) {
+                if (pos >= buf.len()) {
+                    return Parsed.NeedMore;
+                }
+                return Parsed.Bad("expected '$'");
+            }
+            let lend = match (find_crlf(buf, pos + 1)) {
+                Option.Some(e) => e,
+                Option.None => {
+                    return Parsed.NeedMore;
+                },
+            };
+            let blen = match (parse_int_bytes(buf, pos + 1, lend)) {
+                Option.Some(v) => v,
+                Option.None => {
+                    return Parsed.Bad("invalid bulk length");
+                },
+            };
+            if (blen < 0 || blen > 536870912) {
+                return Parsed.Bad("invalid bulk length");
+            }
+            let dstart = lend + 2;
+            if (dstart + blen + 2 > buf.len()) {
+                return Parsed.NeedMore;
+            }
+            out.push(buf.sub_bytes(dstart, dstart + blen));
+            pos = dstart + blen + 2;
+            i = i + 1;
+        }
+        Parsed.Cmd(out, pos)
+    }
+}
+
+// --- Encoders ---------------------------------------------------------------
+
+pub fn simple(s: string) -> bytes {
+    ("+" + s + "\r\n").to_bytes()
+}
+
+pub fn error(s: string) -> bytes {
+    ("-ERR " + s + "\r\n").to_bytes()
+}
+
+pub fn integer(n: int) -> bytes {
+    (":" + to_string(n) + "\r\n").to_bytes()
+}
+
+pub fn nil() -> bytes {
+    "$-1\r\n".to_bytes()
+}
+
+pub fn bulk(b: bytes) -> bytes {
+    ("$" + to_string(b.len()) + "\r\n").to_bytes() + b + "\r\n".to_bytes()
+}
+
+pub fn bulk_str(s: string) -> bytes {
+    bulk(s.to_bytes())
+}
+
+pub fn array_header(n: int) -> bytes {
+    ("*" + to_string(n) + "\r\n").to_bytes()
+}
+
+pub fn array_of(items: [bytes]) -> bytes {
+    var out = array_header(items.len());
+    for it in items {
+        out = out + bulk(it);
+    }
+    out
+}
+
+// The full command back in wire form (what the AOF stores).
+pub fn encode_command(args: [bytes]) -> bytes {
+    array_of(args)
+}

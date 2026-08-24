@@ -1,0 +1,181 @@
+// raykv — the TCP front: one fiber per connection, incremental RESP parsing,
+// commands serialized through the store actor (like Redis, single-threaded
+// where it counts). A subscribed connection gains a writer fiber fed by its
+// pub/sub channel while the reader keeps parsing.
+import std/net;
+import resp;
+import store;
+
+pub fn start(bind: string, port: int, sv: Channel<store.Sv>) -> Result<int, string> {
+    let listener = net.tcp_listen(bind, port)?;
+    let actual = net.local_port(listener);
+    spawn(fn() {
+        // No bare `return;` in here: a return inside a spawned closure makes
+        // the native transpiler emit a closure typed () that clashes with its
+        // __RaySend wrapper (recorded finding) — a flag ends the loop instead.
+        var next_id = 1;
+        var running = true;
+        while (running) {
+            match (net.tcp_accept(listener)) {
+                Result.Err(e) => {
+                    running = false;
+                },
+                Result.Ok(h) => {
+                    let conn_id = next_id;
+                    next_id = next_id + 1;
+                    spawn(fn() {
+                        serve_conn(h, conn_id, sv);
+                    });
+                },
+            }
+        }
+    });
+    Result.Ok(actual)
+}
+
+fn upper(b: bytes) -> string {
+    match (from_utf8(b)) {
+        Result.Ok(s) => s.to_upper(),
+        Result.Err(e) => "",
+    }
+}
+
+fn arg_str(args: [bytes], i: int) -> string {
+    match (from_utf8(args[i])) {
+        Result.Ok(s) => s,
+        Result.Err(e) => "",
+    }
+}
+
+fn serve_conn(h: int, conn_id: int, sv: Channel<store.Sv>) {
+    let reply: Channel<bytes> = Channel.bounded(1);
+    // The pub/sub out channel exists from the start; a writer fiber drains it
+    // only once the connection subscribes.
+    let pushes: Channel<bytes> = Channel.bounded(64);
+    var writer_running = false;
+    var buf = b"";
+    var alive = true;
+    while (alive) {
+        match (net.socket_read_bytes(h)) {
+            Result.Err(e) => {
+                alive = false;
+            },
+            Result.Ok(chunk) => {
+                if (chunk.len() == 0) {
+                    alive = false;
+                } else {
+                    buf = buf + chunk;
+                    var more = true;
+                    while (more && alive) {
+                        match (resp.parse(buf)) {
+                            resp.Parsed.NeedMore => {
+                                more = false;
+                            },
+                            resp.Parsed.Bad(e) => {
+                                net.socket_write_bytes(h, resp.error(e));
+                                alive = false;
+                            },
+                            resp.Parsed.Cmd(args, used) => {
+                                buf = buf.sub_bytes(used, buf.len());
+                                if (args.len() == 0) {
+                                    more = more;
+                                } else {
+                                    let cmd = upper(args[0]);
+                                    var out = b"";
+                                    if (cmd == "SUBSCRIBE" && args.len() >= 2) {
+                                        var i = 1;
+                                        while (i < args.len()) {
+                                            send(
+                                                sv,
+                                                store.Sv.Subscribe(
+                                                    conn_id,
+                                                    arg_str(args, i),
+                                                    pushes,
+                                                    reply
+                                                )
+                                            );
+                                            match (recv(reply)) {
+                                                Option.Some(r) => {
+                                                    out = out + r;
+                                                },
+                                                Option.None => { },
+                                            }
+                                            i = i + 1;
+                                        }
+                                        if (!writer_running) {
+                                            writer_running = true;
+                                            spawn(fn() {
+                                                var pumping = true;
+                                                while (pumping) {
+                                                    match (recv(pushes)) {
+                                                        Option.Some(frame) => {
+                                                            match (net.socket_write_bytes(
+                                                            h,
+                                                            frame
+                                                        )) {
+                                                                Result.Ok(n) => { },
+                                                                Result.Err(e) => {
+                                                                    pumping = false;
+                                                                },
+                                                            }
+                                                        },
+                                                        Option.None => {
+                                                            pumping = false;
+                                                        },
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    } else if (cmd == "UNSUBSCRIBE" && args.len() >= 2) {
+                                        var i = 1;
+                                        while (i < args.len()) {
+                                            send(
+                                                sv,
+                                                store.Sv.Unsubscribe(
+                                                    conn_id,
+                                                    arg_str(args, i),
+                                                    reply
+                                                )
+                                            );
+                                            match (recv(reply)) {
+                                                Option.Some(r) => {
+                                                    out = out + r;
+                                                },
+                                                Option.None => { },
+                                            }
+                                            i = i + 1;
+                                        }
+                                    } else if (cmd == "QUIT") {
+                                        net.socket_write_bytes(h, resp.simple("OK"));
+                                        alive = false;
+                                    } else {
+                                        send(sv, store.Sv.Cmd(args, reply));
+                                        match (recv(reply)) {
+                                            Option.Some(r) => {
+                                                out = r;
+                                            },
+                                            Option.None => {
+                                                alive = false;
+                                            },
+                                        }
+                                    }
+                                    if (alive && out.len() > 0) {
+                                        match (net.socket_write_bytes(h, out)) {
+                                            Result.Ok(n) => { },
+                                            Result.Err(e) => {
+                                                alive = false;
+                                            },
+                                        }
+                                    }
+                                }
+                            },
+                        }
+                    }
+                }
+            },
+        }
+    }
+    send(sv, store.Sv.Gone(conn_id));
+    close(pushes);
+    close(h);
+}

@@ -1,0 +1,79 @@
+// raykv — the append-only file: RESP-encoded logical commands, replayed with
+// the same incremental parser the server uses. A torn tail (crash mid-append)
+// simply fails to parse and is discarded. Same durability caveat as rayq:
+// std/fs has no fsync, so appends are crash-safe, not power-loss-safe.
+import std/fs;
+import resp;
+
+pub struct Aof {
+    handle: int,
+    enabled: bool,
+}
+
+pub fn disabled() -> Aof {
+    Aof { handle: 0 - 1, enabled: false }
+}
+
+pub fn append(a: Aof, args: [bytes]) {
+    if (!a.enabled) {
+        return;
+    }
+    // fs has no write_bytes-on-handle: commands are ASCII-framed RESP, and
+    // VALUES may be arbitrary bytes… write(h, string) forces UTF-8 (recorded
+    // finding). Binary-unsafe values would corrupt here; we accept UTF-8
+    // payloads for v1.
+    match (from_utf8(resp.encode_command(args))) {
+        Result.Ok(s) => {
+            fs.write(a.handle, s);
+        },
+        Result.Err(e) => { },
+    }
+}
+
+pub fn replay(path: string) -> [[bytes]] {
+    var out: [[bytes]] = [];
+    if (!fs.exists(path)) {
+        return out;
+    }
+    match (fs.read_file_bytes(path)) {
+        Result.Err(e) => out,
+        Result.Ok(all) => {
+            var buf = all;
+            var more = true;
+            while (more) {
+                match (resp.parse(buf)) {
+                    resp.Parsed.Cmd(args, used) => {
+                        out.push(args);
+                        buf = buf.sub_bytes(used, buf.len());
+                    },
+                    resp.Parsed.NeedMore => {
+                        more = false;
+                    },
+                    resp.Parsed.Bad(e) => {
+                        more = false;
+                    },
+                }
+            }
+            out
+        },
+    }
+}
+
+// Rewrites the AOF to the live dataset (SET + PEXPIREAT pairs), renames it
+// into place, and returns the fresh append handle.
+pub fn rewrite_and_open(path: string, commands: [[bytes]]) -> Result<Aof, string> {
+    let tmp = path + ".tmp";
+    var content = "";
+    for cmd in commands {
+        match (from_utf8(resp.encode_command(cmd))) {
+            Result.Ok(s) => {
+                content = content + s;
+            },
+            Result.Err(e) => { },
+        }
+    }
+    fs.write_file(tmp, content)?;
+    fs.rename(tmp, path)?;
+    let h = fs.open(path, "a")?;
+    Result.Ok(Aof { handle: h, enabled: true })
+}
