@@ -26,7 +26,7 @@ $ redis-cli -p 7379 SUBSCRIBE noticias   # y en otra terminal: PUBLISH noticias 
 
 **raykv nativo queda a ~86% de Redis real** con 50 conexiones concurrentes —
 el camino socket → parser RESP incremental → actor → Map → respuesta aguanta.
-La AOF apenas cuesta (sin fsync, ver hallazgos). La VM queda a ~55% de Redis.
+La AOF apenas cuesta (ahora con fsync por append — re-mide si te importa el pico). La VM queda a ~55% de Redis.
 
 ## Cómo está hecho
 
@@ -56,8 +56,8 @@ La AOF apenas cuesta (sin fsync, ver hallazgos). La VM queda a ~55% de Redis.
 | Compatible redis-cli, redis-benchmark y `net/redis` (tests con ambos) | ✅ |
 | Binario nativo a ~86% de Redis real | ✅ |
 | Tests (parser incremental, E2E con net/redis + reinicio) | ✅ 8 |
-| fsync (durabilidad ante corte de luz) | ❌ bloqueado (sin `fs.sync`, IDEAS §66) |
-| Valores binarios en la AOF | ❌ bloqueado (sin `fs.write_bytes` sobre handle) |
+| fsync (durabilidad ante corte de luz) | ✅ (raylang M115.1: `fs.sync` por append) |
+| Valores binarios en la AOF | ✅ (raylang M115.1: `fs.write_bytes`) |
 | Hashes/listas/sets, RDB snapshot, replicación | 📋 fuera de v1 |
 
 ## Hallazgos de dogfood (necesidades confirmadas del lenguaje)
@@ -66,13 +66,12 @@ Anotados en `raylang/IDEAS.md` §68:
 
 1. **Nativo: un `return;` dentro de una clausura `spawn` rompe el build**
    (E0308: el cierre generado infiere `()` y choca con `__RaySend::U`).
-   Workaround: bandera de salida en vez de `return`. Tercer bug del
-   transpilador nativo encontrado por las apps.
-2. **No hay `fs.write_bytes(handle, bytes)`**: `fs.write` es solo string →
-   una AOF con valores binarios se corrompería; raykv acepta solo payloads
-   UTF-8 en la AOF (los sockets sí tienen write_bytes — la asimetría es del
-   módulo fs).
-3. La ausencia de fsync/locks (§66) aplica igual aquí.
+   Workaround: bandera de salida en vez de `return`. [RESUELTO en raylang,
+   PR #140: el cuerpo del spawn se emite como IIFE y `return;` compila.]
+2. **[RESUELTO — raylang M115.1]** No hay `fs.write_bytes(handle, bytes)`:
+   existe, y la AOF es BINARIA (valores \x00/\xff/no-UTF-8 intactos).
+3. **[RESUELTO — raylang M115.1]** La ausencia de fsync: cada append pasa por
+   `fs.sync` (durable ante corte de luz).
 4. **Positivo**: el pipeline bytes → parser incremental → actor → Map aguanta
    124k ops/s con 50 conexiones — el costo del round-trip por canal por
    comando es asumible incluso a escala redis-benchmark.

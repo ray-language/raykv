@@ -1,7 +1,8 @@
 // raykv — the append-only file: RESP-encoded logical commands, replayed with
 // the same incremental parser the server uses. A torn tail (crash mid-append)
-// simply fails to parse and is discarded. Same durability caveat as rayq:
-// std/fs has no fsync, so appends are crash-safe, not power-loss-safe.
+// simply fails to parse and is discarded. Since raylang M115.1 the append is
+// BINARY (fs.write_bytes: values are arbitrary bytes, not UTF-8-only) and
+// fsync'd (fs.sync: durable across power loss, not just a process crash).
 import std/fs;
 import resp;
 
@@ -18,15 +19,13 @@ pub fn append(a: Aof, args: [bytes]) {
     if (!a.enabled) {
         return;
     }
-    // fs has no write_bytes-on-handle: commands are ASCII-framed RESP, and
-    // VALUES may be arbitrary bytes… write(h, string) forces UTF-8 (recorded
-    // finding). Binary-unsafe values would corrupt here; we accept UTF-8
-    // payloads for v1.
-    match (from_utf8(resp.encode_command(args))) {
-        Result.Ok(s) => {
-            fs.write(a.handle, s);
+    // fs.write_bytes (raylang M115.1): el frame RESP va en BYTES — los valores binarios
+    // (\x00, \xff, no-UTF-8) persisten intactos. fs.sync: durable ante corte de luz.
+    match (fs.write_bytes(a.handle, resp.encode_command(args))) {
+        Result.Ok(_n) => {
+            let _ = fs.sync(a.handle);
         },
-        Result.Err(e) => { },
+        Result.Err(_e) => { },
     }
 }
 
@@ -63,16 +62,11 @@ pub fn replay(path: string) -> [[bytes]] {
 // into place, and returns the fresh append handle.
 pub fn rewrite_and_open(path: string, commands: [[bytes]]) -> Result<Aof, string> {
     let tmp = path + ".tmp";
-    var content = "";
+    var content = b"";
     for cmd in commands {
-        match (from_utf8(resp.encode_command(cmd))) {
-            Result.Ok(s) => {
-                content = content + s;
-            },
-            Result.Err(e) => { },
-        }
+        content = content + resp.encode_command(cmd);
     }
-    fs.write_file(tmp, content)?;
+    fs.write_file_bytes(tmp, content)?;
     fs.rename(tmp, path)?;
     let h = fs.open(path, "a")?;
     Result.Ok(Aof { handle: h, enabled: true })
