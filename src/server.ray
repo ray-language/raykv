@@ -110,9 +110,9 @@ fn serve_conn(h: int, conn_id: int, sv: Channel<store.Sv>) {
                                                     match (recv(pushes)) {
                                                         Option.Some(frame) => {
                                                             match (net.socket_write_bytes(
-                                                            h,
-                                                            frame
-                                                        )) {
+                                                                h,
+                                                                frame
+                                                            )) {
                                                                 Result.Ok(n) => { },
                                                                 Result.Err(e) => {
                                                                     pumping = false;
