@@ -12,7 +12,7 @@ pub struct Aof {
 }
 
 pub fn disabled() -> Aof {
-    Aof { handle: 0 - 1, enabled: false }
+    Aof { handle: -1, enabled: false }
 }
 
 pub fn append(a: Aof, args: [bytes]) {
@@ -38,18 +38,15 @@ pub fn replay(path: string) -> [[bytes]] {
         Result.Err(e) => out,
         Result.Ok(all) => {
             var buf = all;
-            var more = true;
-            while (more) {
+            while (true) {
                 match (resp.parse(buf)) {
                     resp.Parsed.Cmd(args, used) => {
                         out.push(args);
                         buf = buf.sub_bytes(used, buf.len());
                     },
-                    resp.Parsed.NeedMore => {
-                        more = false;
-                    },
-                    resp.Parsed.Bad(e) => {
-                        more = false;
+                    // NeedMore/Bad: a torn tail from a crash mid-append.
+                    _ => {
+                        break;
                     },
                 }
             }

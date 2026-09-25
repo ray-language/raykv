@@ -41,7 +41,7 @@ fn parse_int_bytes(buf: bytes, start: int, end: int) -> Option<int> {
         v = v * 10 + (d - 48);
         i = i + 1;
     }
-    if (neg) { Option.Some(0 - v) } else { Option.Some(v) }
+    if (neg) { Option.Some(-v) } else { Option.Some(v) }
 }
 
 // One command from buf[0..): Cmd(args, consumed) | NeedMore | Bad.
@@ -141,11 +141,11 @@ pub fn integer(n: int) -> bytes {
 }
 
 pub fn nil() -> bytes {
-    "$-1\r\n".to_bytes()
+    b"$-1\r\n"
 }
 
 pub fn bulk(b: bytes) -> bytes {
-    ("$" + to_string(b.len()) + "\r\n").to_bytes() + b + "\r\n".to_bytes()
+    ("$" + to_string(b.len()) + "\r\n").to_bytes() + b + b"\r\n"
 }
 
 pub fn bulk_str(s: string) -> bytes {
