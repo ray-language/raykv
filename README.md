@@ -47,7 +47,8 @@ temporizador) es el siguiente paso — ver v2. La VM queda a ~43% de Redis.
 - **AOF lógica**: `INCR` se persiste como el `SET` de su resultado; TTL como
   `PEXPIREAT` absoluto en epoch-ms (sobrevive reinicios con reloj de pared).
   Replay con el mismo parser del servidor (cola rota = descartada); rewrite
-  compactante al arrancar con `fs.rename` atómico. `kill -9` probado.
+  compactante al arrancar con `fs.rename` atómico (el temporal pasa por
+  `fs.sync` antes del rename). `kill -9` probado.
 - Expiración: perezosa en cada acceso + barrido cada 250 ms.
 - `COMMAND`/`CONFIG`/`CLIENT`/`INFO` responden benignamente (el ruido de
   handshake de redis-cli/redis-benchmark).
