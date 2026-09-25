@@ -63,8 +63,24 @@ pub fn rewrite_and_open(path: string, commands: [[bytes]]) -> Result<Aof, string
     for cmd in commands {
         content = content + resp.encode_command(cmd);
     }
-    fs.write_file_bytes(tmp, content)?;
+    // fsync the rewrite BEFORE the atomic rename: otherwise a power loss right
+    // after it can leave the only AOF empty or partial.
+    write_synced(tmp, content)?;
     fs.rename(tmp, path)?;
     let h = fs.open(path, "a")?;
     Result.Ok(Aof { handle: h, enabled: true })
+}
+
+// write_file_bytes + fsync, closing the handle on every path.
+fn write_synced(path: string, content: bytes) -> Result<int, string> {
+    let h = fs.open(path, "w")?;
+    let r = write_then_sync(h, content);
+    close(h);
+    r
+}
+
+fn write_then_sync(h: int, content: bytes) -> Result<int, string> {
+    let n = fs.write_bytes(h, content)?;
+    fs.sync(h)?;
+    Result.Ok(n)
 }
