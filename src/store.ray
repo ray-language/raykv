@@ -495,9 +495,7 @@ fn sweep(st: Store) {
 fn actor_loop(ch: Channel<Sv>, st: Store) {
     var running = true;
     while (running) {
-        match (recv(
-    ch
-)) {
+        match (recv(ch)) {
             Option.None => {
                 running = false;
             },
@@ -516,7 +514,10 @@ fn actor_loop(ch: Channel<Sv>, st: Store) {
                         st.subs.insert(channel, list);
                         send(
                             reply,
-                            resp.array_header(3) + resp.bulk_str("subscribe") + resp.bulk_str(channel) + resp.integer(1)
+                            resp.array_header(3)
+                                + resp.bulk_str("subscribe")
+                                + resp.bulk_str(channel)
+                                + resp.integer(1)
                         );
                     },
                     Sv.Unsubscribe(conn_id, channel, reply) => {
@@ -538,7 +539,10 @@ fn actor_loop(ch: Channel<Sv>, st: Store) {
                         }
                         send(
                             reply,
-                            resp.array_header(3) + resp.bulk_str("unsubscribe") + resp.bulk_str(channel) + resp.integer(0)
+                            resp.array_header(3)
+                                + resp.bulk_str("unsubscribe")
+                                + resp.bulk_str(channel)
+                                + resp.integer(0)
                         );
                     },
                     Sv.Gone(conn_id) => {

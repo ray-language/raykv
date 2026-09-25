@@ -60,28 +60,25 @@ fn main() -> int {
         return 0;
     }
     let persist = !has_flag(av, "--no-aof");
-    match (store.start(
-    flag_str(av, "--dir", "./raykv-data"),
-    persist
-)) {
+    match (store.start(flag_str(av, "--dir", "./raykv-data"), persist)) {
         Result.Err(e) => {
             eprint("raykv: " + e);
             1
         },
         Result.Ok(sv) => {
             let port = flag_int(av, "--port", DEFAULT_PORT);
-            match (server.start(
-            flag_str(av, "--bind", "127.0.0.1"),
-            port,
-            sv
-        )) {
+            match (server.start(flag_str(av, "--bind", "127.0.0.1"), port, sv)) {
                 Result.Err(e) => {
                     eprint("raykv: " + e);
                     1
                 },
                 Result.Ok(actual) => {
                     eprint(
-                        "raykv listening on port " + to_string(actual) + if (persist) { " (aof on)" } else { " (aof off)" }
+                        "raykv listening on port " + to_string(actual) + if (persist) {
+                            " (aof on)"
+                        } else {
+                            " (aof off)"
+                        }
                     );
                     match (recv(signals())) {
                         Option.Some(sig) => {
