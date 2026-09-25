@@ -37,10 +37,7 @@ fn upper(b: bytes) -> string {
 }
 
 fn arg_str(args: [bytes], i: int) -> string {
-    match (from_utf8(args[i])) {
-        Result.Ok(s) => s,
-        Result.Err(e) => "",
-    }
+    from_utf8(args[i]).unwrap_or("")
 }
 
 // Per-connection state shared by the read loop and the command dispatcher.
