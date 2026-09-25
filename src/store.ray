@@ -70,23 +70,12 @@ fn now_ms() -> int {
 fn dump_commands(data: Map<string, Entry>) -> [[bytes]] {
     var out: [[bytes]] = [];
     let t = now_ms();
-    for k in data.keys() {
-        match (get(data, k)) {
-            Option.Some(e) => {
-                if (e.expires_at == 0 || e.expires_at > t) {
-                    out.push(["SET".to_bytes(), k.to_bytes(), e.value]);
-                    if (e.expires_at > 0) {
-                        out.push(
-                            [
-                                "PEXPIREAT".to_bytes(),
-                                k.to_bytes(),
-                                to_string(e.expires_at).to_bytes()
-                            ]
-                        );
-                    }
-                }
-            },
-            Option.None => { },
+    for (k, e) in data {
+        if (e.expires_at == 0 || e.expires_at > t) {
+            out.push([b"SET", k.to_bytes(), e.value]);
+            if (e.expires_at > 0) {
+                out.push([b"PEXPIREAT", k.to_bytes(), to_string(e.expires_at).to_bytes()]);
+            }
         }
     }
     out
@@ -144,7 +133,7 @@ fn live(st: Store, k: string) -> Option<Entry> {
             if (e.expires_at > 0 && e.expires_at <= now_ms()) {
                 st.data.remove(k);
                 if (st.persist) {
-                    aof.append(st.log, ["DEL".to_bytes(), k.to_bytes()]);
+                    aof.append(st.log, [b"DEL", k.to_bytes()]);
                 }
                 return Option.None;
             }
@@ -158,12 +147,9 @@ fn log_set(st: Store, k: string, v: bytes, expires_at: int) {
     if (!st.persist) {
         return;
     }
-    aof.append(st.log, ["SET".to_bytes(), k.to_bytes(), v]);
+    aof.append(st.log, [b"SET", k.to_bytes(), v]);
     if (expires_at > 0) {
-        aof.append(
-            st.log,
-            ["PEXPIREAT".to_bytes(), k.to_bytes(), to_string(expires_at).to_bytes()]
-        );
+        aof.append(st.log, [b"PEXPIREAT", k.to_bytes(), to_string(expires_at).to_bytes()]);
     }
 }
 
@@ -290,10 +276,7 @@ fn expire_cmd(st: Store, args: [bytes], unit_ms: int, absolute: bool) -> bytes {
                     let at = if (absolute) { n } else { now_ms() + n * unit_ms };
                     st.data.insert(k, Entry { value: e.value, expires_at: at });
                     if (st.persist) {
-                        aof.append(
-                            st.log,
-                            ["PEXPIREAT".to_bytes(), k.to_bytes(), to_string(at).to_bytes()]
-                        );
+                        aof.append(st.log, [b"PEXPIREAT", k.to_bytes(), to_string(at).to_bytes()]);
                     }
                     resp.integer(1)
                 },
@@ -311,25 +294,31 @@ fn publish(st: Store, channel: string, payload: bytes) -> int {
     match (get(st.subs, channel)) {
         Option.None => 0,
         Option.Some(list) => {
+            // try_send, never send: the actor serves every client, so a
+            // subscriber whose push buffer is full (slow reader) or already
+            // closed (connection gone) misses this message instead of
+            // stalling the whole keyspace. Returns the receivers reached.
             let frame = push_frame(channel, payload);
+            var reached = 0;
             for s in list {
-                send(s.out, frame);
+                if (try_send(s.out, frame)) {
+                    reached = reached + 1;
+                }
             }
-            list.len()
+            reached
         },
     }
+}
+
+fn without_conn(list: [Subscriber], conn_id: int) -> [Subscriber] {
+    list.filter(fn(s: Subscriber) -> bool { s.conn_id != conn_id })
 }
 
 fn drop_conn(st: Store, conn_id: int) {
     for ch in st.subs.keys() {
         match (get(st.subs, ch)) {
             Option.Some(list) => {
-                var keep: [Subscriber] = [];
-                for s in list {
-                    if (s.conn_id != conn_id) {
-                        keep.push(s);
-                    }
-                }
+                let keep = without_conn(list, conn_id);
                 if (keep.len() == 0) {
                     st.subs.remove(ch);
                 } else {
@@ -370,7 +359,7 @@ pub fn execute(st: Store, args: [bytes]) -> bytes {
                     st.data.remove(k);
                     n = n + 1;
                     if (st.persist) {
-                        aof.append(st.log, ["DEL".to_bytes(), k.to_bytes()]);
+                        aof.append(st.log, [b"DEL", k.to_bytes()]);
                     }
                 },
                 Option.None => { },
@@ -394,7 +383,7 @@ pub fn execute(st: Store, args: [bytes]) -> bytes {
     } else if (cmd == "INCR" && args.len() >= 2) {
         incr_by(st, arg_str(args, 1), 1)
     } else if (cmd == "DECR" && args.len() >= 2) {
-        incr_by(st, arg_str(args, 1), 0 - 1)
+        incr_by(st, arg_str(args, 1), -1)
     } else if (cmd == "INCRBY" && args.len() >= 3) {
         match (arg_int(args, 2)) {
             Option.Some(d) => incr_by(st, arg_str(args, 1), d),
@@ -411,10 +400,10 @@ pub fn execute(st: Store, args: [bytes]) -> bytes {
             return resp.error("wrong number of arguments");
         }
         match (live(st, arg_str(args, 1))) {
-            Option.None => resp.integer(0 - 2),
+            Option.None => resp.integer(-2),
             Option.Some(e) => {
                 if (e.expires_at == 0) {
-                    resp.integer(0 - 1)
+                    resp.integer(-1)
                 } else {
                     let left = e.expires_at - now_ms();
                     if (cmd == "TTL") { resp.integer((left + 999) / 1000) } else {
@@ -432,25 +421,20 @@ pub fn execute(st: Store, args: [bytes]) -> bytes {
         let pattern = arg_str(args, 1);
         var hits: [bytes] = [];
         let t = now_ms();
-        for k in st.data.keys() {
-            match (get(st.data, k)) {
-                Option.Some(e) => {
-                    if ((e.expires_at == 0 || e.expires_at > t) && glob_match(pattern, k)) {
-                        hits.push(k.to_bytes());
-                    }
-                },
-                Option.None => { },
+        for (k, e) in st.data {
+            if ((e.expires_at == 0 || e.expires_at > t) && glob_match(pattern, k)) {
+                hits.push(k.to_bytes());
             }
         }
         resp.array_of(hits)
     } else if (cmd == "DBSIZE") {
-        resp.integer(st.data.keys().len())
+        resp.integer(st.data.len())
     } else if (cmd == "FLUSHALL" || cmd == "FLUSHDB") {
         for k in st.data.keys() {
             st.data.remove(k);
         }
         if (st.persist) {
-            aof.append(st.log, ["FLUSHALL".to_bytes()]);
+            aof.append(st.log, [b"FLUSHALL"]);
         }
         resp.simple("OK")
     } else if (cmd == "PUBLISH" && args.len() >= 3) {
@@ -474,30 +458,24 @@ pub fn execute(st: Store, args: [bytes]) -> bytes {
 fn sweep(st: Store) {
     let t = now_ms();
     var doomed: [string] = [];
-    for k in st.data.keys() {
-        match (get(st.data, k)) {
-            Option.Some(e) => {
-                if (e.expires_at > 0 && e.expires_at <= t) {
-                    doomed.push(k);
-                }
-            },
-            Option.None => { },
+    for (k, e) in st.data {
+        if (e.expires_at > 0 && e.expires_at <= t) {
+            doomed.push(k);
         }
     }
     for k in doomed {
         st.data.remove(k);
         if (st.persist) {
-            aof.append(st.log, ["DEL".to_bytes(), k.to_bytes()]);
+            aof.append(st.log, [b"DEL", k.to_bytes()]);
         }
     }
 }
 
 fn actor_loop(ch: Channel<Sv>, st: Store) {
-    var running = true;
-    while (running) {
+    while (true) {
         match (recv(ch)) {
             Option.None => {
-                running = false;
+                break;
             },
             Option.Some(msg) => {
                 match (msg) {
@@ -523,12 +501,7 @@ fn actor_loop(ch: Channel<Sv>, st: Store) {
                     Sv.Unsubscribe(conn_id, channel, reply) => {
                         match (get(st.subs, channel)) {
                             Option.Some(list) => {
-                                var keep: [Subscriber] = [];
-                                for s in list {
-                                    if (s.conn_id != conn_id) {
-                                        keep.push(s);
-                                    }
-                                }
+                                let keep = without_conn(list, conn_id);
                                 if (keep.len() == 0) {
                                     st.subs.remove(channel);
                                 } else {

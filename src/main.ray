@@ -44,22 +44,13 @@ fn flag_str(av: [string], name: string, fallback: string) -> string {
     }
 }
 
-fn has_flag(av: [string], name: string) -> bool {
-    for a in av {
-        if (a == name) {
-            return true;
-        }
-    }
-    false
-}
-
 fn main() -> int {
     let av = args();
-    if (has_flag(av, "--help") || has_flag(av, "-h")) {
+    if (av.contains("--help") || av.contains("-h")) {
         usage();
         return 0;
     }
-    let persist = !has_flag(av, "--no-aof");
+    let persist = !av.contains("--no-aof");
     match (store.start(flag_str(av, "--dir", "./raykv-data"), persist)) {
         Result.Err(e) => {
             eprint("raykv: " + e);
@@ -73,13 +64,11 @@ fn main() -> int {
                     1
                 },
                 Result.Ok(actual) => {
-                    eprint(
-                        "raykv listening on port " + to_string(actual) + if (persist) {
-                            " (aof on)"
-                        } else {
-                            " (aof off)"
-                        }
-                    );
+                    eprint("raykv listening on port " + to_string(actual) + if (persist) {
+                        " (aof on)"
+                    } else {
+                        " (aof off)"
+                    });
                     match (recv(signals())) {
                         Option.Some(sig) => {
                             eprint("raykv: shutting down (signal " + to_string(sig) + ")");

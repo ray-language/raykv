@@ -1,0 +1,39 @@
+// The keyspace actor in isolation (no sockets, no AOF).
+import store;
+
+fn start() -> Channel<store.Sv> {
+    match (store.start("unused", false)) {
+        Result.Ok(sv) => sv,
+        Result.Err(e) => panic(e),
+    }
+}
+
+fn call(sv: Channel<store.Sv>, args: [string]) -> string {
+    let reply: Channel<bytes> = Channel.bounded(1);
+    send(sv, store.Sv.Cmd(args.map(fn(a: string) -> bytes { a.to_bytes() }), reply));
+    match (recv(reply)) {
+        Option.Some(b) => match (from_utf8(b)) {
+            Result.Ok(s) => s,
+            Result.Err(e) => panic(e),
+        },
+        Option.None => panic("store gone"),
+    }
+}
+
+@test
+fn a_stalled_subscriber_does_not_block_the_keyspace() {
+    let sv = start();
+    // A subscriber that never drains its (tiny) push buffer.
+    let pushes: Channel<bytes> = Channel.bounded(1);
+    let reply: Channel<bytes> = Channel.bounded(1);
+    send(sv, store.Sv.Subscribe(1, "news", pushes, reply));
+    recv(reply);
+    assert_eq(call(sv, ["PUBLISH", "news", "one"]), ":1\r\n");
+    // Buffer full: the message is dropped for that subscriber, the actor goes on.
+    assert_eq(call(sv, ["PUBLISH", "news", "two"]), ":0\r\n");
+    assert_eq(call(sv, ["PING"]), "+PONG\r\n");
+    // A subscriber whose connection is gone (channel closed) is skipped too.
+    close(pushes);
+    assert_eq(call(sv, ["PUBLISH", "news", "three"]), ":0\r\n");
+    assert_eq(call(sv, ["SET", "k", "v"]), "+OK\r\n");
+}
