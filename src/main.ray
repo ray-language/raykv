@@ -56,11 +56,11 @@ fn main() -> int {
                     1
                 },
                 Result.Ok(actual) => {
-                    eprint("raykv listening on port " + to_string(actual) + if (persist) {
-                        " (aof on)"
-                    } else {
-                        " (aof off)"
-                    });
+                    eprint(
+                        "raykv listening on port "
+                            + to_string(actual)
+                            + if (persist) { " (aof on)" } else { " (aof off)" }
+                    );
                     match (recv(signals())) {
                         Option.Some(sig) => {
                             eprint("raykv: shutting down (signal " + to_string(sig) + ")");

@@ -11,15 +11,10 @@ pub enum Parsed {
     Bad(string),
 }
 
+// bytes.index_of_from (raylang 1.27.13): search from `start` without copying
+// the tail with sub_bytes or scanning byte by byte.
 fn find_crlf(buf: bytes, start: int) -> Option<int> {
-    var i = start;
-    while (i + 1 < buf.len()) {
-        if (buf[i] == 13 && buf[i + 1] == 10) {
-            return Option.Some(i);
-        }
-        i = i + 1;
-    }
-    Option.None
+    buf.index_of_from(b"\r\n", start)
 }
 
 fn parse_int_bytes(buf: bytes, start: int, end: int) -> Option<int> {
