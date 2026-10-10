@@ -1,8 +1,11 @@
 // raykv — the append-only file: RESP-encoded logical commands, replayed with
 // the same incremental parser the server uses. A torn tail (crash mid-append)
 // simply fails to parse and is discarded. Since raylang M115.1 the append is
-// BINARY (fs.write_bytes: values are arbitrary bytes, not UTF-8-only) and
-// fsync'd (fs.sync: durable across power loss, not just a process crash).
+// BINARY (fs.write_bytes: values are arbitrary bytes, not UTF-8-only). Each
+// append is flushed with fs.sync_data (fdatasync: survives a process or OS
+// crash; on macOS/APFS it skips the drive-cache flush, so a power cut can lose
+// the last appends). The rewrite is the checkpoint: it goes through a full
+// fs.sync before the rename.
 import std/fs;
 import resp;
 
@@ -19,11 +22,11 @@ pub fn append(a: Aof, args: [bytes]) {
     if (!a.enabled) {
         return;
     }
-    // fs.write_bytes (raylang M115.1): el frame RESP va en BYTES — los valores binarios
-    // (\x00, \xff, no-UTF-8) persisten intactos. fs.sync: durable ante corte de luz.
+    // The RESP frame goes as BYTES, so binary values (\x00, \xff, non-UTF-8)
+    // persist intact. sync_data per append: fs.sync here capped writes at ~240/s.
     match (fs.write_bytes(a.handle, resp.encode_command(args))) {
         Result.Ok(_n) => {
-            let _ = fs.sync(a.handle);
+            let _ = fs.sync_data(a.handle);
         },
         Result.Err(_e) => { },
     }

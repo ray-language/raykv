@@ -23,14 +23,18 @@ re-medido con raylang 1.27.11 (septiembre 2026):
 | **raykv nativo (AOF off)** | 147.5k rps | 154.3k rps | 0.20 ms |
 | raykv VM (AOF off) | 72.9k rps | 75.5k rps | 0.68 ms |
 | Redis 7 real (sin persistencia) | 175.4k rps | 175.4k rps | 0.15 ms |
-| raykv nativo (AOF on, fsync por append) | ~240 rps | — | 189 ms |
+| raykv nativo (AOF on, `sync_data` por append) | 36.1k rps | — | 1.24 ms |
+| raykv nativo (AOF on, `sync` por append, ≤ 1.27.20) | ~240 rps | — | 189 ms |
 
 **raykv nativo queda a ~84–88% de Redis real** con 50 conexiones concurrentes —
 el camino socket → parser RESP incremental → actor → Map → respuesta aguanta.
-La AOF **con fsync por escritura** (la política `appendfsync always` de Redis)
-sí cuesta: en macOS cada `fs.sync` ronda los 4 ms y el actor lo serializa, así
-que las escrituras caen a ~240/s. Un modo `everysec` (fsync agrupado por un
-temporizador) es el siguiente paso — ver v2. La VM queda a ~43% de Redis.
+La AOF vuelca **cada escritura** (la política `appendfsync always` de Redis)
+con `fs.sync_data` (fdatasync): ~36k SET/s en nativo. Con `fs.sync` caían a
+~240/s, porque en macOS es un `F_FULLFSYNC` de ~4 ms y el actor lo serializa.
+La contrapartida: en APFS `sync_data` no vacía la caché del disco, así que un
+corte de luz puede perder los últimos appends (un crash del proceso o del SO,
+no). El rewrite sí pasa por `fs.sync` antes del rename. La VM queda a ~43% de
+Redis.
 
 ## Cómo está hecho
 
@@ -65,7 +69,7 @@ temporizador) es el siguiente paso — ver v2. La VM queda a ~43% de Redis.
 | Compatible redis-cli, redis-benchmark y `net/redis` (tests con ambos) | ✅ |
 | Binario nativo a ~84–88% de Redis real | ✅ |
 | Tests (parser incremental, actor, E2E con net/redis + reinicio) | ✅ 9 |
-| fsync (durabilidad ante corte de luz) | ✅ (raylang M115.1: `fs.sync` por append) |
+| Volcado por append (`fs.sync_data`; `fs.sync` en el rewrite) | ✅ (raylang 1.27.21) |
 | Valores binarios en la AOF | ✅ (raylang M115.1: `fs.write_bytes`) |
 | `appendfsync everysec` (fsync agrupado; hoy es por append) | 📋 v2 |
 | Hashes/listas/sets, RDB snapshot, replicación | 📋 fuera de v1 |
@@ -81,14 +85,15 @@ Anotados en `raylang/IDEAS.md` §68:
 2. **[RESUELTO — raylang M115.1]** No hay `fs.write_bytes(handle, bytes)`:
    existe, y la AOF es BINARIA (valores \x00/\xff/no-UTF-8 intactos).
 3. **[RESUELTO — raylang M115.1]** La ausencia de fsync: cada append pasa por
-   `fs.sync` (durable ante corte de luz).
+   `fs.sync`. **[RESUELTO — raylang 1.27.21]** `fs.sync_data` ya es barato en
+   APFS (~36k SET/s frente a ~240): lo usa cada append.
 4. **Positivo**: el pipeline bytes → parser incremental → actor → Map aguanta
    ~150k ops/s con 50 conexiones — el costo del round-trip por canal por
    comando es asumible incluso a escala redis-benchmark.
 
 ## Desarrollo
 
-Requiere raylang ≥ 1.27; la dependencia `net` viene del índice de paquetes
+Requiere raylang ≥ 1.27.21; la dependencia `net` viene del índice de paquetes
 (`net = "^0.3.3"` en `ray.toml`, versión exacta fijada en `ray.lock`).
 
 ```sh
