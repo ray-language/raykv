@@ -4,12 +4,13 @@
 import std/fs;
 import std/time;
 import net/redis;
+import aof;
 import store;
 import server;
 
 // Boots a store over dir plus a server on an ephemeral port; returns the port.
 fn boot(dir: string) -> int {
-    let sv = match (store.start(dir, true)) {
+    let sv = match (store.start(dir, true, aof.Fsync.Data)) {
         Result.Ok(s) => s,
         Result.Err(e) => panic(e),
     };

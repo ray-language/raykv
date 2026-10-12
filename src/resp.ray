@@ -41,20 +41,27 @@ fn parse_int_bytes(buf: bytes, start: int, end: int) -> Option<int> {
 
 // One command from buf[0..): Cmd(args, consumed) | NeedMore | Bad.
 pub fn parse(buf: bytes) -> Parsed {
-    if (buf.len() == 0) {
+    parse_at(buf, 0)
+}
+
+// One command from buf[start..), without copying the tail: Cmd(args, consumed
+// from start) | NeedMore | Bad. Lets a reader walk a big buffer (the AOF
+// replay) by offset instead of re-slicing it after every command.
+pub fn parse_at(buf: bytes, start: int) -> Parsed {
+    if (buf.len() <= start) {
         return Parsed.NeedMore;
     }
-    if (buf[0] != 42) {
+    if (buf[start] != 42) {
         // Inline command: a single line, split on spaces.
-        match (find_crlf(buf, 0)) {
+        match (find_crlf(buf, start)) {
             Option.None => {
-                if (buf.len() > 65536) {
+                if (buf.len() - start > 65536) {
                     return Parsed.Bad("inline command too long");
                 }
                 Parsed.NeedMore
             },
             Option.Some(e) => {
-                match (from_utf8(buf.sub_bytes(0, e))) {
+                match (from_utf8(buf.sub_bytes(start, e))) {
                     Result.Err(err) => Parsed.Bad("invalid inline command"),
                     Result.Ok(line) => {
                         var out: [bytes] = [];
@@ -63,19 +70,19 @@ pub fn parse(buf: bytes) -> Parsed {
                                 out.push(part.trim().to_bytes());
                             }
                         }
-                        Parsed.Cmd(out, e + 2)
+                        Parsed.Cmd(out, e + 2 - start)
                     },
                 }
             },
         }
     } else {
-        let head_end = match (find_crlf(buf, 1)) {
+        let head_end = match (find_crlf(buf, start + 1)) {
             Option.Some(e) => e,
             Option.None => {
                 return Parsed.NeedMore;
             },
         };
-        let n = match (parse_int_bytes(buf, 1, head_end)) {
+        let n = match (parse_int_bytes(buf, start + 1, head_end)) {
             Option.Some(v) => v,
             Option.None => {
                 return Parsed.Bad("invalid multibulk length");
@@ -117,7 +124,7 @@ pub fn parse(buf: bytes) -> Parsed {
             pos = dstart + blen + 2;
             i = i + 1;
         }
-        Parsed.Cmd(out, pos)
+        Parsed.Cmd(out, pos - start)
     }
 }
 

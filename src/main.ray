@@ -1,17 +1,28 @@
 // raykv — a RESP2 key-value server redis-cli can talk to.
 import std/io;
+import aof;
 import store;
 import server;
 
 const DEFAULT_PORT: int = 7379;
 
 fn usage() {
-    eprint("usage: raykv [--bind H] [--port N] [--dir DIR] [--no-aof]");
+    eprint("usage: raykv [--bind H] [--port N] [--dir DIR] [--no-aof] [--fsync data|full]");
     eprint("");
     eprint("  RESP2 server (redis-cli / redis-benchmark compatible subset):");
     eprint("  PING ECHO SET(EX/PX/NX/XX) GET DEL EXISTS INCR/DECR/INCRBY");
     eprint("  EXPIRE/PEXPIRE/TTL/PTTL TYPE KEYS DBSIZE FLUSHALL SUBSCRIBE/PUBLISH");
     eprint("  default port " + to_string(DEFAULT_PORT) + "; AOF in DIR (default ./raykv-data)");
+    eprint("  --fsync data (default): fdatasync per batch, survives a process/OS crash");
+    eprint("  --fsync full: full fsync per batch, survives a power cut too (slower)");
+}
+
+fn fsync_flag(av: [string]) -> Result<aof.Fsync, string> {
+    match (flag_str(av, "--fsync", "data")) {
+        "data" => Result.Ok(aof.Fsync.Data),
+        "full" => Result.Ok(aof.Fsync.Full),
+        other => Result.Err("--fsync must be data or full, got '" + other + "'"),
+    }
 }
 
 fn flag_value(av: [string], name: string) -> Option<string> {
@@ -43,7 +54,14 @@ fn main() -> int {
         return 0;
     }
     let persist = !av.contains("--no-aof");
-    match (store.start(flag_str(av, "--dir", "./raykv-data"), persist)) {
+    let fsync = match (fsync_flag(av)) {
+        Result.Ok(f) => f,
+        Result.Err(e) => {
+            eprint("raykv: " + e);
+            return 2;
+        },
+    };
+    match (store.start(flag_str(av, "--dir", "./raykv-data"), persist, fsync)) {
         Result.Err(e) => {
             eprint("raykv: " + e);
             1
@@ -56,10 +74,14 @@ fn main() -> int {
                     1
                 },
                 Result.Ok(actual) => {
+                    let mode = match (fsync) {
+                        aof.Fsync.Data => "data",
+                        aof.Fsync.Full => "full",
+                    };
                     eprint(
                         "raykv listening on port "
                             + to_string(actual)
-                            + if (persist) { " (aof on)" } else { " (aof off)" }
+                            + if (persist) { " (aof on, fsync " + mode + ")" } else { " (aof off)" }
                     );
                     match (recv(signals())) {
                         Option.Some(sig) => {
