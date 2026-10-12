@@ -1,8 +1,9 @@
 // The keyspace actor in isolation (no sockets, no AOF).
+import aof;
 import store;
 
 fn start() -> Channel<store.Sv> {
-    match (store.start("unused", false)) {
+    match (store.start("unused", false, aof.Fsync.Data)) {
         Result.Ok(sv) => sv,
         Result.Err(e) => panic(e),
     }

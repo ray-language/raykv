@@ -4,7 +4,7 @@ Servidor clave-valor **hablando RESP2**, escrito en [raylang](https://github.com
 
 ```text
 $ raykv &
-raykv listening on port 7379 (aof on)
+raykv listening on port 7379 (aof on, fsync data)
 
 $ redis-cli -p 7379 SET saludo hola
 OK
@@ -15,26 +15,43 @@ $ redis-cli -p 7379 SUBSCRIBE noticias   # y en otra terminal: PUBLISH noticias 
 
 ## El benchmark honesto (contra Redis real)
 
-`redis-benchmark -t set,get -n 50000 -c 50`, misma máquina (Apple Silicon),
-re-medido con raylang 1.27.11 (septiembre 2026):
+`redis-benchmark -t set,get -n 50000 -c 50`, misma máquina (Apple M3 Pro, 11 núcleos),
+re-medido con raylang 1.27.46 (octubre 2026; mediana de 3–5 corridas):
 
-| Servidor | SET | GET | p50 |
+| Servidor | SET | GET | p50 SET |
 |---|---|---|---|
-| **raykv nativo (AOF off)** | 147.5k rps | 154.3k rps | 0.20 ms |
-| raykv VM (AOF off) | 72.9k rps | 75.5k rps | 0.68 ms |
-| Redis 7 real (sin persistencia) | 175.4k rps | 175.4k rps | 0.15 ms |
-| raykv nativo (AOF on, `sync_data` por append) | 36.1k rps | — | 1.24 ms |
-| raykv nativo (AOF on, `sync` por append, ≤ 1.27.20) | ~240 rps | — | 189 ms |
+| **raykv nativo (AOF off)** | 155.3k rps | 155.8k rps | 0.21 ms |
+| raykv VM (AOF off) | 74.5k rps | 74.9k rps | 0.67 ms |
+| Redis 8.8 real (sin persistencia) | 174.8k rps | 176.1k rps | 0.16 ms |
+| **raykv nativo (AOF, `--fsync data`: `sync_data` por tanda)** | 137.7k rps | 156.3k rps | 0.26 ms |
+| raykv nativo (AOF, `--fsync full`: `sync` por tanda) | 5.6k rps | — | 8.6 ms |
+| Redis 8.8 real (`appendfsync always`) | 5.5k rps | 162.3k rps | 9.1 ms |
+| raykv nativo (AOF, `sync_data` por append, hasta este cambio) | 38.4k rps | — | 1.24 ms |
+| raykv nativo (AOF, `sync` por append, ≤ 1.27.20) | ~240 rps | — | 189 ms |
 
-**raykv nativo queda a ~84–88% de Redis real** con 50 conexiones concurrentes —
+**raykv nativo queda a ~88% de Redis real** con 50 conexiones concurrentes —
 el camino socket → parser RESP incremental → actor → Map → respuesta aguanta.
-La AOF vuelca **cada escritura** (la política `appendfsync always` de Redis)
-con `fs.sync_data` (fdatasync): ~36k SET/s en nativo. Con `fs.sync` caían a
-~240/s, porque en macOS es un `F_FULLFSYNC` de ~4 ms y el actor lo serializa.
-La contrapartida: en APFS `sync_data` no vacía la caché del disco, así que un
-corte de luz puede perder los últimos appends (un crash del proceso o del SO,
-no). El rewrite sí pasa por `fs.sync` antes del rename. La VM queda a ~43% de
-Redis.
+La VM queda a ~43% de Redis.
+
+**La AOF hace *group commit*.** Ninguna respuesta sale antes de que su
+escritura esté en disco (la política `appendfsync always` de Redis), pero el
+actor no vuelca escritura por escritura. Toma un mensaje, vacía lo que ya está
+en cola detrás (hasta 256), hace **un** volcado y solo entonces responde.
+Bajo carga la cola se llena mientras dura el volcado, y uno solo cubre muchas
+escrituras. Redis hace lo mismo en cada vuelta de su bucle de eventos.
+
+- `--fsync data` (por defecto): `fs.sync_data` (fdatasync) por tanda.
+  ~138k SET/s, 3,6× el volcado por append y ~89% de raykv sin AOF. Sobrevive
+  a un crash del proceso o del SO, pero en APFS no vacía la caché del disco:
+  un corte de luz puede perder la última tanda.
+- `--fsync full`: `fs.sync` (`F_FULLFSYNC` en macOS, ~4 ms) por tanda.
+  Sobrevive también a un corte de luz. ~5,6k SET/s con 50 clientes, lo mismo
+  que Redis con `appendfsync always`, que en macOS también usa `F_FULLFSYNC`
+  (con un solo cliente, los dos rondan las ~200 escrituras/s).
+
+El agrupado solo rinde con concurrencia: con 1 conexión no hay cola, y
+`--fsync data` hace ~19k SET/s igual que antes. El rewrite del arranque pasa
+siempre por `fs.sync` antes del rename.
 
 ## Cómo está hecho
 
@@ -50,7 +67,8 @@ Redis.
 - Sockets de cliente con `TCP_NODELAY` y `SO_KEEPALIVE` (como Redis).
 - **AOF lógica**: `INCR` se persiste como el `SET` de su resultado; TTL como
   `PEXPIREAT` absoluto en epoch-ms (sobrevive reinicios con reloj de pared).
-  Replay con el mismo parser del servidor (cola rota = descartada); rewrite
+  Replay con el mismo parser del servidor, recorriendo el archivo por
+  desplazamiento (`resp.parse_at`; cola rota = descartada); rewrite
   compactante al arrancar con `fs.rename` atómico (el temporal pasa por
   `fs.sync` antes del rename). `kill -9` probado.
 - Expiración: perezosa en cada acceso + barrido cada 250 ms.
@@ -67,11 +85,12 @@ Redis.
 | Un suscriptor lento no bloquea el keyspace (`try_send`) | ✅ |
 | AOF lógica + replay + rewrite compactante (kill -9 probado) | ✅ |
 | Compatible redis-cli, redis-benchmark y `net/redis` (tests con ambos) | ✅ |
-| Binario nativo a ~84–88% de Redis real | ✅ |
-| Tests (parser incremental, actor, E2E con net/redis + reinicio) | ✅ 9 |
-| Volcado por append (`fs.sync_data`; `fs.sync` en el rewrite) | ✅ (raylang 1.27.21) |
+| Binario nativo a ~88% de Redis real | ✅ |
+| Tests (parser incremental, actor, AOF, E2E con net/redis + reinicio) | ✅ 13 |
+| Group commit: un volcado por tanda, respuesta después del volcado (`--fsync data\|full`) | ✅ |
 | Valores binarios en la AOF | ✅ (raylang M115.1: `fs.write_bytes`) |
-| `appendfsync everysec` (fsync agrupado; hoy es por append) | 📋 v2 |
+| Arranque lineal: 200k claves en ~0,5 s (antes ~38 s: replay y rewrite cuadráticos) | ✅ |
+| `appendfsync everysec` (volcar una vez por segundo, respondiendo antes) | 📋 v2 |
 | Hashes/listas/sets, RDB snapshot, replicación | 📋 fuera de v1 |
 
 ## Hallazgos de dogfood (necesidades confirmadas del lenguaje)
@@ -97,8 +116,9 @@ Requiere raylang ≥ 1.27.21; la dependencia `net` viene del índice de paquetes
 (`net = "^0.3.3"` en `ray.toml`, versión exacta fijada en `ray.lock`).
 
 ```sh
-ray test                          # 9 tests
+ray test                          # 13 tests
 ray run src/main.ray --no-aof --port 7379
+ray run src/main.ray --fsync full --port 7379   # AOF que sobrevive a un corte de luz
 ray build --native src/main.ray -o raykv --release
 redis-benchmark -p 7379 -t set,get -n 50000 -c 50 -q
 ```

@@ -1,0 +1,81 @@
+// The AOF: replay by offset with a torn tail, and group commit — appends stay
+// pending until flush(), and a store reply comes after its write.
+import std/fs;
+import aof;
+import resp;
+import store;
+
+fn temp_dir(prefix: string) -> string {
+    match (fs.make_temp_dir(prefix)) {
+        Result.Ok(d) => d,
+        Result.Err(e) => panic(e),
+    }
+}
+
+@test
+fn replay_walks_every_command_and_drops_a_torn_tail() {
+    let dir = temp_dir("raykv_aof_replay");
+    let path = dir + "/raykv.aof";
+    var content = b"";
+    var i = 0;
+    while (i < 500) {
+        content = content + resp.encode_command([b"SET", to_string(i).to_bytes(), b"\x00\xff"]);
+        i = i + 1;
+    }
+    // A crash mid-append leaves half a frame at the end.
+    content = content + "*3\r\n$3\r\nSET\r\n$1\r\nx".to_bytes();
+    match (fs.write_file_bytes(path, content)) {
+        Result.Ok(_n) => { },
+        Result.Err(e) => panic(e),
+    }
+    let cmds = aof.replay(path);
+    assert_eq(cmds.len(), 500);
+    assert_eq(cmds[499][1], b"499");
+    assert_eq(cmds[499][2], b"\x00\xff");
+    fs.remove_all(dir);
+}
+
+@test
+fn a_reply_comes_after_the_write_reached_the_file() {
+    let dir = temp_dir("raykv_aof_commit");
+    let sv = match (store.start(dir, true, aof.Fsync.Data)) {
+        Result.Ok(s) => s,
+        Result.Err(e) => panic(e),
+    };
+    let reply: Channel<bytes> = Channel.bounded(1);
+    send(sv, store.Sv.Cmd([b"SET", b"durable", b"yes"], reply));
+    assert_eq(recv(reply).unwrap_or(b""), b"+OK\r\n");
+    // Read the file as another reader would: the SET must already be there.
+    // (Whether it was also fsynced is not observable from a process; the
+    // append/flush contract is covered by appends_stay_pending_until_flush.)
+    let on_disk = match (fs.read_file_bytes(dir + "/raykv.aof")) {
+        Result.Ok(b) => b,
+        Result.Err(e) => panic(e),
+    };
+    let frame = resp.encode_command([b"SET", b"durable", b"yes"]);
+    assert(on_disk.index_of(frame).is_some());
+    fs.remove_all(dir);
+}
+
+@test
+fn appends_stay_pending_until_flush() {
+    let dir = temp_dir("raykv_aof_flush");
+    let path = dir + "/raykv.aof";
+    let empty: [[bytes]] = [];
+    let log = match (aof.rewrite_and_open(path, empty, aof.Fsync.Full)) {
+        Result.Ok(a) => a,
+        Result.Err(e) => panic(e),
+    };
+    assert(!aof.pending(log));
+    aof.append(log, [b"SET", b"a", b"1"]);
+    aof.append(log, [b"SET", b"b", b"2"]);
+    assert(aof.pending(log));
+    aof.flush(log);
+    assert(!aof.pending(log));
+    assert_eq(aof.replay(path).len(), 2);
+    // A disabled AOF never has anything pending.
+    let off = aof.disabled();
+    aof.append(off, [b"SET", b"c", b"3"]);
+    assert(!aof.pending(off));
+    fs.remove_all(dir);
+}

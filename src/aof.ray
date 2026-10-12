@@ -1,21 +1,32 @@
 // raykv — the append-only file: RESP-encoded logical commands, replayed with
 // the same incremental parser the server uses. A torn tail (crash mid-append)
 // simply fails to parse and is discarded. Since raylang M115.1 the append is
-// BINARY (fs.write_bytes: values are arbitrary bytes, not UTF-8-only). Each
-// append is flushed with fs.sync_data (fdatasync: survives a process or OS
+// BINARY (fs.write_bytes: values are arbitrary bytes, not UTF-8-only).
+//
+// Group commit: append only writes; the store actor calls flush() once per
+// batch of commands and replies after it, so an OK always means "on disk".
+// Fsync.Data flushes with fs.sync_data (fdatasync: survives a process or OS
 // crash; on macOS/APFS it skips the drive-cache flush, so a power cut can lose
-// the last appends). The rewrite is the checkpoint: it goes through a full
-// fs.sync before the rename.
+// the last batch). Fsync.Full flushes with fs.sync (F_FULLFSYNC on macOS:
+// survives a power cut too — Redis' appendfsync always). The rewrite is the
+// checkpoint: it always goes through a full fs.sync before the rename.
 import std/fs;
 import resp;
+
+pub enum Fsync {
+    Data,
+    Full,
+}
 
 pub struct Aof {
     handle: int,
     enabled: bool,
+    fsync: Fsync,
+    dirty: bool,
 }
 
 pub fn disabled() -> Aof {
-    Aof { handle: -1, enabled: false }
+    Aof { handle: -1, enabled: false, fsync: Fsync.Data, dirty: false }
 }
 
 pub fn append(a: Aof, args: [bytes]) {
@@ -23,12 +34,34 @@ pub fn append(a: Aof, args: [bytes]) {
         return;
     }
     // The RESP frame goes as BYTES, so binary values (\x00, \xff, non-UTF-8)
-    // persist intact. sync_data per append: fs.sync here capped writes at ~240/s.
+    // persist intact. No sync here: flush() covers the whole batch.
     match (fs.write_bytes(a.handle, resp.encode_command(args))) {
         Result.Ok(_n) => {
-            let _ = fs.sync_data(a.handle);
+            a.dirty = true;
         },
         Result.Err(_e) => { },
+    }
+}
+
+// Whether there are appends not yet flushed to disk.
+pub fn pending(a: Aof) -> bool {
+    a.dirty
+}
+
+// Forces every append since the last flush to disk: one sync per batch
+// instead of one per append (fs.sync per append capped writes at ~240/s).
+pub fn flush(a: Aof) {
+    if (!a.enabled || !a.dirty) {
+        return;
+    }
+    a.dirty = false;
+    match (a.fsync) {
+        Fsync.Data => {
+            let _ = fs.sync_data(a.handle);
+        },
+        Fsync.Full => {
+            let _ = fs.sync(a.handle);
+        },
     }
 }
 
@@ -40,12 +73,14 @@ pub fn replay(path: string) -> [[bytes]] {
     match (fs.read_file_bytes(path)) {
         Result.Err(e) => out,
         Result.Ok(all) => {
-            var buf = all;
+            // Walk by offset: re-slicing the tail after every command made the
+            // replay quadratic (~14 s for a 4 MB AOF).
+            var pos = 0;
             while (true) {
-                match (resp.parse(buf)) {
+                match (resp.parse_at(all, pos)) {
                     resp.Parsed.Cmd(args, used) => {
                         out.push(args);
-                        buf = buf.sub_bytes(used, buf.len());
+                        pos = pos + used;
                     },
                     // NeedMore/Bad: a torn tail from a crash mid-append.
                     _ => {
@@ -60,30 +95,32 @@ pub fn replay(path: string) -> [[bytes]] {
 
 // Rewrites the AOF to the live dataset (SET + PEXPIREAT pairs), renames it
 // into place, and returns the fresh append handle.
-pub fn rewrite_and_open(path: string, commands: [[bytes]]) -> Result<Aof, string> {
+pub fn rewrite_and_open(path: string, commands: [[bytes]], fsync: Fsync) -> Result<Aof, string> {
     let tmp = path + ".tmp";
-    var content = b"";
-    for cmd in commands {
-        content = content + resp.encode_command(cmd);
-    }
     // fsync the rewrite BEFORE the atomic rename: otherwise a power loss right
     // after it can leave the only AOF empty or partial.
-    write_synced(tmp, content)?;
+    write_synced(tmp, commands)?;
     fs.rename(tmp, path)?;
     let h = fs.open(path, "a")?;
-    Result.Ok(Aof { handle: h, enabled: true })
+    Result.Ok(Aof { handle: h, enabled: true, fsync: fsync, dirty: false })
 }
 
-// write_file_bytes + fsync, closing the handle on every path.
-fn write_synced(path: string, content: bytes) -> Result<int, string> {
+// Writes every command + fsync, closing the handle on every path.
+fn write_synced(path: string, commands: [[bytes]]) -> Result<int, string> {
     let h = fs.open(path, "w")?;
-    let r = write_then_sync(h, content);
+    let r = write_then_sync(h, commands);
     close(h);
     r
 }
 
-fn write_then_sync(h: int, content: bytes) -> Result<int, string> {
-    let n = fs.write_bytes(h, content)?;
+// One write per frame into the buffered handle: concatenating the whole file
+// in memory first (content + frame) made the rewrite quadratic (~25 s for
+// 200k keys).
+fn write_then_sync(h: int, commands: [[bytes]]) -> Result<int, string> {
+    var n = 0;
+    for cmd in commands {
+        n = n + fs.write_bytes(h, resp.encode_command(cmd))?;
+    }
     fs.sync(h)?;
     Result.Ok(n)
 }

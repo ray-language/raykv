@@ -104,3 +104,24 @@ fn encoders_round() {
         Result.Err(e) => panic(e),
     }
 }
+
+@test
+fn parse_at_walks_a_buffer_by_offset() {
+    let one = "*2\r\n$3\r\nGET\r\n$1\r\na\r\n".to_bytes();
+    let wire = one + "PING\r\n".to_bytes() + "*2\r\n$3\r\nGE".to_bytes();
+    match (resp.parse_at(wire, 0)) {
+        resp.Parsed.Cmd(args, used) => assert_eq(used, one.len()),
+        _ => panic("expected the first command"),
+    }
+    match (resp.parse_at(wire, one.len())) {
+        resp.Parsed.Cmd(args, used) => {
+            assert_eq(args.len(), 1);
+            assert_eq(used, 6);
+        },
+        _ => panic("expected the inline command"),
+    }
+    match (resp.parse_at(wire, one.len() + 6)) {
+        resp.Parsed.NeedMore => { },
+        _ => panic("expected NeedMore on the torn tail"),
+    }
+}

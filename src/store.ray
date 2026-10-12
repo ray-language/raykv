@@ -34,7 +34,7 @@ struct Store {
     persist: bool,
 }
 
-pub fn start(dir: string, persist: bool) -> Result<Channel<Sv>, string> {
+pub fn start(dir: string, persist: bool, fsync: aof.Fsync) -> Result<Channel<Sv>, string> {
     let ch: Channel<Sv> = Channel.bounded(1024);
     var data: Map<string, Entry> = Map.new();
     var subs: Map<string, [Subscriber]> = Map.new();
@@ -48,7 +48,7 @@ pub fn start(dir: string, persist: bool) -> Result<Channel<Sv>, string> {
         for cmd in replayed {
             apply_only(data, cmd);
         }
-        log = aof.rewrite_and_open(path, dump_commands(data))?;
+        log = aof.rewrite_and_open(path, dump_commands(data), fsync)?;
     }
     let st = Store { data: data, subs: subs, log: log, persist: persist };
     spawn(fn() {
@@ -468,61 +468,94 @@ fn sweep(st: Store) {
     }
 }
 
+// Group commit: take one message, then whatever is already queued behind it
+// (up to MAX_BATCH), flush the AOF once, and only then send the command
+// replies, so no client sees OK before its write is on disk. Under load the
+// queue fills while the actor syncs, and one sync covers many writes.
+const MAX_BATCH: int = 256;
+
 fn actor_loop(ch: Channel<Sv>, st: Store) {
     while (true) {
         match (recv(ch)) {
             Option.None => {
                 break;
             },
-            Option.Some(msg) => {
-                match (msg) {
-                    Sv.Cmd(args, reply) => {
-                        send(reply, execute(st, args));
-                    },
-                    Sv.Subscribe(conn_id, channel, out, reply) => {
-                        var fresh: [Subscriber] = [];
-                        var list = match (get(st.subs, channel)) {
-                            Option.Some(l) => l,
-                            Option.None => fresh,
-                        };
-                        list.push(Subscriber { conn_id: conn_id, out: out });
-                        st.subs.insert(channel, list);
-                        send(
-                            reply,
-                            resp.array_header(3)
-                                + resp.bulk_str("subscribe")
-                                + resp.bulk_str(channel)
-                                + resp.integer(1)
-                        );
-                    },
-                    Sv.Unsubscribe(conn_id, channel, reply) => {
-                        match (get(st.subs, channel)) {
-                            Option.Some(list) => {
-                                let keep = without_conn(list, conn_id);
-                                if (keep.len() == 0) {
-                                    st.subs.remove(channel);
-                                } else {
-                                    st.subs.insert(channel, keep);
-                                }
-                            },
-                            Option.None => { },
-                        }
-                        send(
-                            reply,
-                            resp.array_header(3)
-                                + resp.bulk_str("unsubscribe")
-                                + resp.bulk_str(channel)
-                                + resp.integer(0)
-                        );
-                    },
-                    Sv.Gone(conn_id) => {
-                        drop_conn(st, conn_id);
-                    },
-                    Sv.Tick => {
-                        sweep(st);
-                    },
+            Option.Some(first) => {
+                var replies: [Channel<bytes>] = [];
+                var frames: [bytes] = [];
+                handle(st, first, replies, frames);
+                var n = 1;
+                while (n < MAX_BATCH) {
+                    match (try_recv(ch)) {
+                        Received.Got(msg) => {
+                            handle(st, msg, replies, frames);
+                            n = n + 1;
+                        },
+                        _ => {
+                            break;
+                        },
+                    }
+                }
+                aof.flush(st.log);
+                var i = 0;
+                while (i < replies.len()) {
+                    send(replies[i], frames[i]);
+                    i = i + 1;
                 }
             },
         }
+    }
+}
+
+// Applies one message. Command replies are held in replies/frames until the
+// batch is flushed; pub/sub acks write nothing to the AOF and go out at once.
+fn handle(st: Store, msg: Sv, replies: [Channel<bytes>], frames: [bytes]) {
+    match (msg) {
+        Sv.Cmd(args, reply) => {
+            replies.push(reply);
+            frames.push(execute(st, args));
+        },
+        Sv.Subscribe(conn_id, channel, out, reply) => {
+            var fresh: [Subscriber] = [];
+            var list = match (get(st.subs, channel)) {
+                Option.Some(l) => l,
+                Option.None => fresh,
+            };
+            list.push(Subscriber { conn_id: conn_id, out: out });
+            st.subs.insert(channel, list);
+            send(
+                reply,
+                resp.array_header(3)
+                    + resp.bulk_str("subscribe")
+                    + resp.bulk_str(channel)
+                    + resp.integer(1)
+            );
+        },
+        Sv.Unsubscribe(conn_id, channel, reply) => {
+            match (get(st.subs, channel)) {
+                Option.Some(list) => {
+                    let keep = without_conn(list, conn_id);
+                    if (keep.len() == 0) {
+                        st.subs.remove(channel);
+                    } else {
+                        st.subs.insert(channel, keep);
+                    }
+                },
+                Option.None => { },
+            }
+            send(
+                reply,
+                resp.array_header(3)
+                    + resp.bulk_str("unsubscribe")
+                    + resp.bulk_str(channel)
+                    + resp.integer(0)
+            );
+        },
+        Sv.Gone(conn_id) => {
+            drop_conn(st, conn_id);
+        },
+        Sv.Tick => {
+            sweep(st);
+        },
     }
 }
