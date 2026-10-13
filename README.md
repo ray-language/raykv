@@ -33,6 +33,40 @@ re-medido con raylang 1.27.46 (octubre 2026; mediana de 3–5 corridas):
 el camino socket → parser RESP incremental → actor → Map → respuesta aguanta.
 La VM queda a ~43% de Redis.
 
+### Pipelining y muchas claves (raylang 1.27.49)
+
+Misma máquina, AOF off salvo donde se indica, mediana de 3 corridas,
+`redis-benchmark -t set,get` con `-P` (comandos en vuelo por conexión) o `-r`
+(claves aleatorias). «antes» es raykv sin los lotes ni el índice de TTL:
+
+| Carga | raykv antes | **raykv** | Redis 8.8 |
+|---|---|---|---|
+| `-c 50 -P 16` SET | 377k | **1.71M** | 1.57M |
+| `-c 50 -P 16` GET | 379k | **1.69M** | 2.05M |
+| `-c 10 -P 1000` SET | 252k | **2.61M** | 2.90M |
+| `-c 10 -P 1000` GET | 230k | **2.19M** | 4.47M |
+| `-c 50 -r 1000000` SET | 121k | **156k** | 184k |
+| `-c 50 -r 1000000` GET | 93k | **156k** | 184k |
+| `-c 50` SET (sin pipelining) | 157k | 157k | 182k |
+| `-c 50 -P 16` SET, `--fsync data` | 239k | **364k** | — |
+
+- **Pipelining por lotes.** La fibra de la conexión manda al actor, en un solo
+  mensaje, todos los comandos completos de una lectura del socket, y escribe
+  todas las respuestas con un solo `write`. Antes era un viaje al actor y un
+  `write` por comando. Con `-P 16`, raykv pasa a Redis en SET.
+  `SUBSCRIBE`/`UNSUBSCRIBE`/`QUIT` cortan el lote para mantener el orden de
+  las respuestas.
+- **Índice de TTL.** El barrido de cada 250 ms recorría (y ordenaba) el
+  keyspace entero buscando claves caducadas: con un millón de claves bajaba
+  GET de 156k a 93k. Ahora recorre solo las claves con TTL.
+- **Sin pipelining el límite no está en raykv.** Perfilado con `sample`, el
+  código de raykv apenas aparece. Respondiendo `PING` sin pasar por el actor
+  salen ~160k, lo mismo que `SET` con actor. El coste está en el camino de
+  red del runtime: el reactor y despertar una fibra en otro hilo. Con
+  `RAYLANG_THREADS=1` (todo en un hilo, como Redis) raykv hace ~182k SET/s
+  con 145% de CPU, en vez de 157k con 530%. A cambio pierde con pipelining y
+  con `--fsync data`, porque `sync_data` bloquea el único hilo.
+
 **La AOF hace *group commit*.** Ninguna respuesta sale antes de que su
 escritura esté en disco (la política `appendfsync always` de Redis), pero el
 actor no vuelca escritura por escritura. Toma un mensaje, vacía lo que ya está
@@ -85,8 +119,8 @@ siempre por `fs.sync` antes del rename.
 | Un suscriptor lento no bloquea el keyspace (`try_send`) | ✅ |
 | AOF lógica + replay + rewrite compactante (kill -9 probado) | ✅ |
 | Compatible redis-cli, redis-benchmark y `net/redis` (tests con ambos) | ✅ |
-| Binario nativo a ~88% de Redis real | ✅ |
-| Tests (parser incremental, actor, AOF, E2E con net/redis + reinicio) | ✅ 13 |
+| Binario nativo a ~86–88% de Redis real sin pipelining; por encima en SET con `-P 16` | ✅ |
+| Tests (parser incremental, actor, lotes, barrido de TTL, AOF, E2E con net/redis + pipelining + reinicio) | ✅ 15 |
 | Group commit: un volcado por tanda, respuesta después del volcado (`--fsync data\|full`) | ✅ |
 | Valores binarios en la AOF | ✅ (raylang M115.1: `fs.write_bytes`) |
 | Arranque lineal: 200k claves en ~0,5 s (antes ~38 s: replay y rewrite cuadráticos) | ✅ |
@@ -116,7 +150,7 @@ Requiere raylang ≥ 1.27.21; la dependencia `net` viene del índice de paquetes
 (`net = "^0.3.3"` en `ray.toml`, versión exacta fijada en `ray.lock`).
 
 ```sh
-ray test                          # 13 tests
+ray test                          # 15 tests
 ray run src/main.ray --no-aof --port 7379
 ray run src/main.ray --fsync full --port 7379   # AOF que sobrevive a un corte de luz
 ray build --native src/main.ray -o raykv --release

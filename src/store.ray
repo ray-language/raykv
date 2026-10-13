@@ -16,6 +16,9 @@ struct Entry {
 
 pub enum Sv {
     Cmd([bytes], Channel<bytes>),
+    // Every command parsed from one socket read (pipelining): one round trip
+    // and one reply holding all the answers, in order.
+    Batch([[bytes]], Channel<bytes>),
     Subscribe(int, string, Channel<bytes>, Channel<bytes>),
     Unsubscribe(int, string, Channel<bytes>),
     Gone(int),
@@ -29,6 +32,9 @@ struct Subscriber {
 
 struct Store {
     data: Map<string, Entry>,
+    // Keys with a TTL and their deadline, so the periodic sweep walks only
+    // those instead of the whole keyspace. Kept in step by put/drop_key.
+    expiring: Map<string, int>,
     subs: Map<string, [Subscriber]>,
     log: aof.Aof,
     persist: bool,
@@ -50,7 +56,13 @@ pub fn start(dir: string, persist: bool, fsync: aof.Fsync) -> Result<Channel<Sv>
         }
         log = aof.rewrite_and_open(path, dump_commands(data), fsync)?;
     }
-    let st = Store { data: data, subs: subs, log: log, persist: persist };
+    var expiring: Map<string, int> = Map.new();
+    for (k, e) in data {
+        if (e.expires_at > 0) {
+            expiring.insert(k, e.expires_at);
+        }
+    }
+    let st = Store { data: data, expiring: expiring, subs: subs, log: log, persist: persist };
     spawn(fn() {
         actor_loop(ch, st);
     });
@@ -123,12 +135,28 @@ fn apply_only(data: Map<string, Entry>, args: [bytes]) {
     }
 }
 
+// Every write to the keyspace goes through put/drop_key, which keep the TTL
+// index in step with the data.
+fn put(st: Store, k: string, e: Entry) {
+    st.data.insert(k, e);
+    if (e.expires_at > 0) {
+        st.expiring.insert(k, e.expires_at);
+    } else {
+        st.expiring.remove(k);
+    }
+}
+
+fn drop_key(st: Store, k: string) {
+    st.data.remove(k);
+    st.expiring.remove(k);
+}
+
 // Live read with lazy expiry.
 fn live(st: Store, k: string) -> Option<Entry> {
     match (get(st.data, k)) {
         Option.Some(e) => {
             if (e.expires_at > 0 && e.expires_at <= now_ms()) {
-                st.data.remove(k);
+                drop_key(st, k);
                 if (st.persist) {
                     aof.append(st.log, [b"DEL", k.to_bytes()]);
                 }
@@ -223,7 +251,7 @@ fn set_cmd(st: Store, args: [bytes]) -> bytes {
     if (nx && exists || xx && !exists) {
         return resp.nil();
     }
-    st.data.insert(k, Entry { value: args[2], expires_at: expires_at });
+    put(st, k, Entry { value: args[2], expires_at: expires_at });
     log_set(st, k, args[2], expires_at);
     resp.simple("OK")
 }
@@ -254,7 +282,7 @@ fn incr_by(st: Store, k: string, delta: int) -> bytes {
     }
     let next = cur + delta;
     let v = to_string(next).to_bytes();
-    st.data.insert(k, Entry { value: v, expires_at: expires_at });
+    put(st, k, Entry { value: v, expires_at: expires_at });
     log_set(st, k, v, expires_at);
     resp.integer(next)
 }
@@ -271,7 +299,7 @@ fn expire_cmd(st: Store, args: [bytes], unit_ms: int, absolute: bool) -> bytes {
                 Option.None => resp.integer(0),
                 Option.Some(e) => {
                     let at = if (absolute) { n } else { now_ms() + n * unit_ms };
-                    st.data.insert(k, Entry { value: e.value, expires_at: at });
+                    put(st, k, Entry { value: e.value, expires_at: at });
                     if (st.persist) {
                         aof.append(st.log, [b"PEXPIREAT", k.to_bytes(), to_string(at).to_bytes()]);
                     }
@@ -353,7 +381,7 @@ pub fn execute(st: Store, args: [bytes]) -> bytes {
             let k = arg_str(args, i);
             match (live(st, k)) {
                 Option.Some(e) => {
-                    st.data.remove(k);
+                    drop_key(st, k);
                     n = n + 1;
                     if (st.persist) {
                         aof.append(st.log, [b"DEL", k.to_bytes()]);
@@ -428,7 +456,7 @@ pub fn execute(st: Store, args: [bytes]) -> bytes {
         resp.integer(st.data.len())
     } else if (cmd == "FLUSHALL" || cmd == "FLUSHDB") {
         for k in st.data.keys() {
-            st.data.remove(k);
+            drop_key(st, k);
         }
         if (st.persist) {
             aof.append(st.log, [b"FLUSHALL"]);
@@ -455,13 +483,13 @@ pub fn execute(st: Store, args: [bytes]) -> bytes {
 fn sweep(st: Store) {
     let t = now_ms();
     var doomed: [string] = [];
-    for (k, e) in st.data {
-        if (e.expires_at > 0 && e.expires_at <= t) {
+    for (k, at) in st.expiring {
+        if (at <= t) {
             doomed.push(k);
         }
     }
     for k in doomed {
-        st.data.remove(k);
+        drop_key(st, k);
         if (st.persist) {
             aof.append(st.log, [b"DEL", k.to_bytes()]);
         }
@@ -514,6 +542,14 @@ fn handle(st: Store, msg: Sv, replies: [Channel<bytes>], frames: [bytes]) {
         Sv.Cmd(args, reply) => {
             replies.push(reply);
             frames.push(execute(st, args));
+        },
+        Sv.Batch(cmds, reply) => {
+            var out = b"";
+            for args in cmds {
+                out = out + execute(st, args);
+            }
+            replies.push(reply);
+            frames.push(out);
         },
         Sv.Subscribe(conn_id, channel, out, reply) => {
             var fresh: [Subscriber] = [];
