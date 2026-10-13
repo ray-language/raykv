@@ -36,26 +36,37 @@ La VM queda a ~43% de Redis.
 ### Pipelining y muchas claves (raylang 1.27.49)
 
 Misma máquina, AOF off salvo donde se indica, mediana de 3 corridas,
-`redis-benchmark -t set,get` con `-P` (comandos en vuelo por conexión) o `-r`
-(claves aleatorias). «antes» es raykv sin los lotes ni el índice de TTL:
+`redis-benchmark -t set,get` con `-P` (comandos en vuelo por conexión), `-d`
+(bytes por valor; por defecto 3) o `-r` (claves aleatorias). «antes» es raykv
+sin los lotes, sin el índice de TTL y sin el camino rápido de GET:
 
-| Carga | raykv antes | **raykv** | Redis 8.8 |
+| Carga | raykv antes SET / GET | **raykv SET / GET** | Redis 8.8 SET / GET |
 |---|---|---|---|
-| `-c 50 -P 16` SET | 377k | **1.71M** | 1.57M |
-| `-c 50 -P 16` GET | 379k | **1.69M** | 2.05M |
-| `-c 10 -P 1000` SET | 252k | **2.61M** | 2.90M |
-| `-c 10 -P 1000` GET | 230k | **2.19M** | 4.47M |
-| `-c 50 -r 1000000` SET | 121k | **156k** | 184k |
-| `-c 50 -r 1000000` GET | 93k | **156k** | 184k |
-| `-c 50` SET (sin pipelining) | 157k | 157k | 182k |
-| `-c 50 -P 16` SET, `--fsync data` | 239k | **364k** | — |
+| `-c 50 -P 16` | 382k / 383k | **1.77M / 1.84M** | 1.58M / 2.10M |
+| `-c 10 -P 1000` | 225k / 293k | **4.09M / 5.65M** | 2.94M / 4.46M |
+| `-c 10 -P 1000 -d 100` | 251k / 294k | **3.53M / 5.02M** | 2.85M / 4.02M |
+| `-c 50 -P 16 -d 1000` | 367k / 360k | **1.58M / 1.55M** | 1.48M / 1.89M |
+| `-c 50 -r 1000000` | 121k / 95k | **157k / 159k** | 183k / 184k |
+| `-c 50` (sin pipelining) | 156k / 158k | 157k / 159k | 180k / 181k |
+| `-c 50 -P 16`, `--fsync data` | 246k / 386k | **382k / 1.83M** | — |
 
 - **Pipelining por lotes.** La fibra de la conexión manda al actor, en un solo
   mensaje, todos los comandos completos de una lectura del socket, y escribe
   todas las respuestas con un solo `write`. Antes era un viaje al actor y un
-  `write` por comando. Con `-P 16`, raykv pasa a Redis en SET.
-  `SUBSCRIBE`/`UNSUBSCRIBE`/`QUIT` cortan el lote para mantener el orden de
-  las respuestas.
+  `write` por comando. `SUBSCRIBE`/`UNSUBSCRIBE`/`QUIT` cortan el lote para
+  mantener el orden de las respuestas.
+- **GET más rápido que SET**, como en Redis (con `-P 1000`, 1,38× frente a
+  1,52×). Juntar las respuestas con `out = out + frame` copiaba todo lo
+  acumulado en cada `+` (cuadrático; las respuestas de GET pesan más que el
+  `+OK` de SET): con valores de 100 bytes, GET caía a ~400k. Ahora:
+  - `resp.concat_all` une por pares, nivel a nivel (n·log n).
+  - GET no construye su respuesta: el actor deja la cabecera (de una tabla
+    `$0`…`$4095` hecha al arrancar), el valor y `\r\n` como trozos sueltos.
+  - Un lote de más de 2 KB vuelve a la conexión sin unir y lo une esa fibra,
+    fuera del actor, que es el único hilo que hace cola.
+  - SET responde con un `+OK\r\n` constante.
+  Con valores de 1 KB GET solo empata con SET: ahí las uniones se llevan ~19%
+  de la CPU, y raylang no tiene una forma lineal de juntar `bytes`.
 - **Índice de TTL.** El barrido de cada 250 ms recorría (y ordenaba) el
   keyspace entero buscando claves caducadas: con un millón de claves bajaba
   GET de 156k a 93k. Ahora recorre solo las claves con TTL.
@@ -119,8 +130,8 @@ siempre por `fs.sync` antes del rename.
 | Un suscriptor lento no bloquea el keyspace (`try_send`) | ✅ |
 | AOF lógica + replay + rewrite compactante (kill -9 probado) | ✅ |
 | Compatible redis-cli, redis-benchmark y `net/redis` (tests con ambos) | ✅ |
-| Binario nativo a ~86–88% de Redis real sin pipelining; por encima en SET con `-P 16` | ✅ |
-| Tests (parser incremental, actor, lotes, barrido de TTL, AOF, E2E con net/redis + pipelining + reinicio) | ✅ 15 |
+| Binario nativo a ~86–88% de Redis real sin pipelining; con pipelining por encima en SET y, con lotes grandes, en GET | ✅ |
+| Tests (parser incremental, actor, lotes, barrido de TTL, AOF, E2E con net/redis + pipelining + reinicio) | ✅ 17 |
 | Group commit: un volcado por tanda, respuesta después del volcado (`--fsync data\|full`) | ✅ |
 | Valores binarios en la AOF | ✅ (raylang M115.1: `fs.write_bytes`) |
 | Arranque lineal: 200k claves en ~0,5 s (antes ~38 s: replay y rewrite cuadráticos) | ✅ |
@@ -150,7 +161,7 @@ Requiere raylang ≥ 1.27.21; la dependencia `net` viene del índice de paquetes
 (`net = "^0.3.3"` en `ray.toml`, versión exacta fijada en `ray.lock`).
 
 ```sh
-ray test                          # 15 tests
+ray test                          # 17 tests
 ray run src/main.ray --no-aof --port 7379
 ray run src/main.ray --fsync full --port 7379   # AOF que sobrevive a un corte de luz
 ray build --native src/main.ray -o raykv --release

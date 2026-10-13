@@ -18,7 +18,7 @@ pub enum Sv {
     Cmd([bytes], Channel<bytes>),
     // Every command parsed from one socket read (pipelining): one round trip
     // and one reply holding all the answers, in order.
-    Batch([[bytes]], Channel<bytes>),
+    Batch([[bytes]], Channel<[bytes]>),
     Subscribe(int, string, Channel<bytes>, Channel<bytes>),
     Unsubscribe(int, string, Channel<bytes>),
     Gone(int),
@@ -30,11 +30,17 @@ struct Subscriber {
     out: Channel<bytes>,
 }
 
+// Bulk headers kept ready-made for values shorter than this (GET replies).
+const BULK_HEADERS: int = 4096;
+
 struct Store {
     data: Map<string, Entry>,
     // Keys with a TTL and their deadline, so the periodic sweep walks only
     // those instead of the whole keyspace. Kept in step by put/drop_key.
     expiring: Map<string, int>,
+    // "$<n>\r\n" for n in 0..BULK_HEADERS, built once: a GET reply does not
+    // format its length.
+    headers: [bytes],
     subs: Map<string, [Subscriber]>,
     log: aof.Aof,
     persist: bool,
@@ -62,7 +68,18 @@ pub fn start(dir: string, persist: bool, fsync: aof.Fsync) -> Result<Channel<Sv>
             expiring.insert(k, e.expires_at);
         }
     }
-    let st = Store { data: data, expiring: expiring, subs: subs, log: log, persist: persist };
+    var headers: [bytes] = [];
+    for n in 0..BULK_HEADERS {
+        headers.push(("$" + to_string(n) + "\r\n").to_bytes());
+    }
+    let st = Store {
+        data: data,
+        expiring: expiring,
+        headers: headers,
+        subs: subs,
+        log: log,
+        persist: persist
+    };
     spawn(fn() {
         actor_loop(ch, st);
     });
@@ -253,7 +270,7 @@ fn set_cmd(st: Store, args: [bytes]) -> bytes {
     }
     put(st, k, Entry { value: args[2], expires_at: expires_at });
     log_set(st, k, args[2], expires_at);
-    resp.simple("OK")
+    resp.OK
 }
 
 fn incr_by(st: Store, k: string, delta: int) -> bytes {
@@ -353,6 +370,48 @@ fn drop_conn(st: Store, conn_id: int) {
             Option.None => { },
         }
     }
+}
+
+// Whether b spells word (ASCII uppercase) in any case, without allocating.
+fn upper_is(b: bytes, word: string) -> bool {
+    let w = word.to_bytes();
+    if (b.len() != w.len()) {
+        return false;
+    }
+    var i = 0;
+    while (i < b.len()) {
+        var c = b[i];
+        if (c >= 97 && c <= 122) {
+            c = c - 32;
+        }
+        if (c != w[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+// Appends the reply to parts. GET, the hot read, pushes header, value and
+// CRLF as separate chunks: concat_all joins the whole batch once.
+fn execute_into(st: Store, args: [bytes], parts: [bytes]) {
+    if (args.len() == 2 && upper_is(args[0], "GET")) {
+        match (live(st, arg_str(args, 1))) {
+            Option.Some(e) => {
+                let n = e.value.len();
+                parts.push(
+                    if (n < st.headers.len()) { st.headers[n] } else { resp.bulk_header(n) }
+                );
+                parts.push(e.value);
+                parts.push(resp.CRLF);
+            },
+            Option.None => {
+                parts.push(resp.nil());
+            },
+        }
+        return;
+    }
+    parts.push(execute(st, args));
 }
 
 pub fn execute(st: Store, args: [bytes]) -> bytes {
@@ -502,6 +561,18 @@ fn sweep(st: Store) {
 // queue fills while the actor syncs, and one sync covers many writes.
 const MAX_BATCH: int = 256;
 
+// Bytes up to which a batch reply is joined by the actor itself.
+const JOIN_IN_ACTOR: int = 2048;
+
+// The replies of one actor batch, held until the AOF flush. A Batch answers
+// with its chunks unjoined: the connection fiber joins them, off the actor.
+struct Out {
+    replies: [Channel<bytes>],
+    frames: [bytes],
+    batch_replies: [Channel<[bytes]>],
+    batch_parts: [[bytes]],
+}
+
 fn actor_loop(ch: Channel<Sv>, st: Store) {
     while (true) {
         match (recv(ch)) {
@@ -509,14 +580,13 @@ fn actor_loop(ch: Channel<Sv>, st: Store) {
                 break;
             },
             Option.Some(first) => {
-                var replies: [Channel<bytes>] = [];
-                var frames: [bytes] = [];
-                handle(st, first, replies, frames);
+                var out = Out { replies: [], frames: [], batch_replies: [], batch_parts: [] };
+                handle(st, first, out);
                 var n = 1;
                 while (n < MAX_BATCH) {
                     match (try_recv(ch)) {
                         Received.Got(msg) => {
-                            handle(st, msg, replies, frames);
+                            handle(st, msg, out);
                             n = n + 1;
                         },
                         _ => {
@@ -526,8 +596,13 @@ fn actor_loop(ch: Channel<Sv>, st: Store) {
                 }
                 aof.flush(st.log);
                 var i = 0;
-                while (i < replies.len()) {
-                    send(replies[i], frames[i]);
+                while (i < out.replies.len()) {
+                    send(out.replies[i], out.frames[i]);
+                    i = i + 1;
+                }
+                i = 0;
+                while (i < out.batch_replies.len()) {
+                    send(out.batch_replies[i], out.batch_parts[i]);
                     i = i + 1;
                 }
             },
@@ -535,21 +610,31 @@ fn actor_loop(ch: Channel<Sv>, st: Store) {
     }
 }
 
-// Applies one message. Command replies are held in replies/frames until the
-// batch is flushed; pub/sub acks write nothing to the AOF and go out at once.
-fn handle(st: Store, msg: Sv, replies: [Channel<bytes>], frames: [bytes]) {
+// Applies one message. Command replies are held in out until the batch is
+// flushed; pub/sub acks write nothing to the AOF and go out at once.
+fn handle(st: Store, msg: Sv, out: Out) {
     match (msg) {
         Sv.Cmd(args, reply) => {
-            replies.push(reply);
-            frames.push(execute(st, args));
+            out.replies.push(reply);
+            out.frames.push(execute(st, args));
         },
         Sv.Batch(cmds, reply) => {
-            var out = b"";
+            var parts: [bytes] = [];
             for args in cmds {
-                out = out + execute(st, args);
+                execute_into(st, args, parts);
             }
-            replies.push(reply);
-            frames.push(out);
+            out.batch_replies.push(reply);
+            // A small reply is cheaper to join here than to ship as chunks; a
+            // big one is joined by the connection fiber, off the actor.
+            var size = 0;
+            for p in parts {
+                size = size + p.len();
+            }
+            if (size <= JOIN_IN_ACTOR) {
+                out.batch_parts.push([resp.concat_all(parts)]);
+            } else {
+                out.batch_parts.push(parts);
+            }
         },
         Sv.Subscribe(conn_id, channel, out, reply) => {
             var fresh: [Subscriber] = [];

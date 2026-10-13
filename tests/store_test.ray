@@ -1,6 +1,7 @@
 // The keyspace actor in isolation (no sockets, no AOF).
 import std/time;
 import aof;
+import resp;
 import store;
 
 fn start() -> Channel<store.Sv> {
@@ -43,7 +44,7 @@ fn a_stalled_subscriber_does_not_block_the_keyspace() {
 @test
 fn a_batch_answers_every_command_in_order() {
     let sv = start();
-    let reply: Channel<bytes> = Channel.bounded(1);
+    let reply: Channel<[bytes]> = Channel.bounded(1);
     let cmds = [["SET", "a", "1"], ["INCR", "a"], ["GET", "a"], ["BOGUS"]];
     send(
         sv,
@@ -52,7 +53,7 @@ fn a_batch_answers_every_command_in_order() {
             reply
         )
     );
-    let got = from_utf8(recv(reply).expect("store gone")).expect("utf8");
+    let got = from_utf8(resp.concat_all(recv(reply).expect("store gone"))).expect("utf8");
     assert_eq(got, "+OK\r\n:2\r\n$1\r\n2\r\n-ERR unknown command 'BOGUS'\r\n");
 }
 
@@ -71,4 +72,17 @@ fn the_sweep_drops_only_expired_keys() {
     assert_eq(call(sv, ["DBSIZE"]), ":3\r\n");
     assert_eq(call(sv, ["GET", "reset"]), "$1\r\ny\r\n");
     assert_eq(call(sv, ["TTL", "reset"]), ":-1\r\n");
+}
+
+@test
+fn a_batch_of_reads_returns_every_value_whole() {
+    let sv = start();
+    // Bigger than JOIN_IN_ACTOR: the chunks come back unjoined.
+    let big = "v".repeat(3000);
+    call(sv, ["SET", "big", big]);
+    call(sv, ["SET", "small", "s"]);
+    let reply: Channel<[bytes]> = Channel.bounded(1);
+    send(sv, store.Sv.Batch([[b"get", b"big"], [b"GET", b"none"], [b"GET", b"small"]], reply));
+    let got = from_utf8(resp.concat_all(recv(reply).expect("store gone"))).expect("utf8");
+    assert_eq(got, "$3000\r\n" + big + "\r\n$-1\r\n$1\r\ns\r\n");
 }

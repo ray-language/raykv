@@ -46,6 +46,8 @@ struct Conn {
     id: int,
     sv: Channel<store.Sv>,
     reply: Channel<bytes>,
+    // A batch comes back as unjoined chunks; this fiber joins them.
+    batch_reply: Channel<[bytes]>,
     // The pub/sub out channel exists from the start; a writer fiber drains it
     // only once the connection subscribes.
     pushes: Channel<bytes>,
@@ -62,6 +64,7 @@ fn serve_conn(h: int, conn_id: int, sv: Channel<store.Sv>) {
         id: conn_id,
         sv: sv,
         reply: Channel.bounded(1),
+        batch_reply: Channel.bounded(1),
         pushes: Channel.bounded(64),
         writer_running: false
     };
@@ -133,10 +136,10 @@ fn flush_batch(c: Conn, batch: [[bytes]]) -> bool {
     if (batch.len() == 0) {
         return true;
     }
-    send(c.sv, store.Sv.Batch(batch, c.reply));
-    match (recv(c.reply)) {
-        Option.Some(r) => {
-            if let Result.Err(e) = net.socket_write_bytes(c.h, r) {
+    send(c.sv, store.Sv.Batch(batch, c.batch_reply));
+    match (recv(c.batch_reply)) {
+        Option.Some(parts) => {
+            if let Result.Err(e) = net.socket_write_bytes(c.h, resp.concat_all(parts)) {
                 return false;
             }
             true
