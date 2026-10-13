@@ -29,9 +29,11 @@ re-medido con raylang 1.27.46 (octubre 2026; mediana de 3–5 corridas):
 | raykv nativo (AOF, `sync_data` por append, hasta este cambio) | 38.4k rps | — | 1.24 ms |
 | raykv nativo (AOF, `sync` por append, ≤ 1.27.20) | ~240 rps | — | 189 ms |
 
-**raykv nativo queda a ~88% de Redis real** con 50 conexiones concurrentes —
-el camino socket → parser RESP incremental → actor → Map → respuesta aguanta.
-La VM queda a ~43% de Redis.
+**Ojo con las filas sin AOF de esta tabla:** con un solo `redis-benchmark`,
+el cliente va al 99–100% de CPU contra los dos servidores, así que mide el
+techo del cliente, no a Redis. Medido con varios clientes, raykv queda a
+~65–73% de Redis sin pipelining (ver «Sin pipelining» más abajo). Las filas
+con AOF no tienen ese problema: las limita el fsync.
 
 ### Pipelining y muchas claves (raylang 1.27.49)
 
@@ -46,8 +48,8 @@ sin los lotes, sin el índice de TTL y sin el camino rápido de GET:
 | `-c 10 -P 1000` | 225k / 293k | **4.09M / 5.65M** | 2.94M / 4.46M |
 | `-c 10 -P 1000 -d 100` | 251k / 294k | **3.53M / 5.02M** | 2.85M / 4.02M |
 | `-c 50 -P 16 -d 1000` | 367k / 360k | **1.58M / 1.55M** | 1.48M / 1.89M |
-| `-c 50 -r 1000000` | 121k / 95k | **157k / 159k** | 183k / 184k |
-| `-c 50` (sin pipelining) | 156k / 158k | 157k / 159k | 180k / 181k |
+| `-c 50 -r 1000000` (cliente saturado) | 121k / 95k | **157k / 159k** | 183k / 184k |
+| `-c 50` (sin pipelining, cliente saturado) | 156k / 158k | 157k / 159k | 180k / 181k |
 | `-c 50 -P 16`, `--fsync data` | 246k / 386k | **382k / 1.83M** | — |
 
 - **Pipelining por lotes.** La fibra de la conexión manda al actor, en un solo
@@ -70,13 +72,42 @@ sin los lotes, sin el índice de TTL y sin el camino rápido de GET:
 - **Índice de TTL.** El barrido de cada 250 ms recorría (y ordenaba) el
   keyspace entero buscando claves caducadas: con un millón de claves bajaba
   GET de 156k a 93k. Ahora recorre solo las claves con TTL.
-- **Sin pipelining el límite no está en raykv.** Perfilado con `sample`, el
-  código de raykv apenas aparece. Respondiendo `PING` sin pasar por el actor
-  salen ~160k, lo mismo que `SET` con actor. El coste está en el camino de
-  red del runtime: el reactor y despertar una fibra en otro hilo. Con
-  `RAYLANG_THREADS=1` (todo en un hilo, como Redis) raykv hace ~182k SET/s
-  con 145% de CPU, en vez de 157k con 530%. A cambio pierde con pipelining y
-  con `--fsync data`, porque `sync_data` bloquea el único hilo.
+
+Con pipelining, Redis va al 97–99% de CPU ya con un solo cliente (con dos,
+±3%): esta tabla sí mide a los servidores. Las dos filas marcadas «cliente
+saturado» no: ver la sección siguiente.
+
+### Sin pipelining (raylang 1.27.49)
+
+Con un solo `redis-benchmark` el cliente se satura (99–100% de CPU contra
+cualquier servidor) y todo parece rondar los 160–180k. Con 2 o 4 procesos
+`redis-benchmark` en paralelo (50 conexiones en total), mediana de 3 corridas:
+
+| Servidor | PING, 2 clientes | SET, 2 clientes | SET, 4 clientes | CPU (2 clientes) |
+|---|---|---|---|---|
+| Redis 8.8 | 270k | 261k | 252k | 98% |
+| servidor raylang mínimo (solo responde `+PONG`), 1 worker | 200k | — | — | 151% |
+| ídem, 11 workers (por defecto) | 193k | — | — | 484% |
+| **raykv, 4 workers** (`RAYLANG_THREADS=4`) | 191k | **191k** | 180k | 361% |
+| raykv, 11 workers, `RAYLANG_SPIN_US=0` | 183k | 182k | 177k | 488% |
+| raykv, 11 workers (por defecto) | 175k | 175k | 165k | 559% |
+| raykv, 1 worker | 166k | 163k | 166k | 145% |
+
+- **~3/4 de la distancia con Redis es del runtime.** Un servidor raylang que
+  no hace nada (una fibra por conexión, sin RESP, ni actor, ni Map) no pasa
+  de ~200k. Perfilado con `sample` a la misma carga, gasta 8,3 µs de CPU por
+  petición frente a 3,2 de Redis: 3,6 µs de `kevent` en el hilo del reactor
+  (Redis: 0,2) y un aviso por pipe al reactor cada vez que una fibra aparca
+  esperando su socket. Anotado para raylang (hallazgo #163).
+- **~1/4 es raykv:** RESP, el salto al actor y el Map le cuestan un 5–10%
+  frente al servidor mínimo con la misma configuración. Perfilado, el código
+  de raykv apenas aparece; el actor no se satura.
+- **Más hilos no ayudan.** Con 11 workers los hilos pasan más de la mitad de
+  su tiempo girando antes de dormirse: `RAYLANG_SPIN_US=0` baja la CPU sin
+  perder nada y raykv gana un 4–7%. Lo mejor medido es `RAYLANG_THREADS=4`. Un
+  solo worker (todo en un hilo, como Redis) se satura con el trabajo de raykv
+  más las syscalls, y además pierde con pipelining y con `--fsync data`,
+  porque `sync_data` bloquea el único hilo.
 
 **La AOF hace *group commit*.** Ninguna respuesta sale antes de que su
 escritura esté en disco (la política `appendfsync always` de Redis), pero el
@@ -130,7 +161,7 @@ siempre por `fs.sync` antes del rename.
 | Un suscriptor lento no bloquea el keyspace (`try_send`) | ✅ |
 | AOF lógica + replay + rewrite compactante (kill -9 probado) | ✅ |
 | Compatible redis-cli, redis-benchmark y `net/redis` (tests con ambos) | ✅ |
-| Binario nativo a ~86–88% de Redis real sin pipelining; con pipelining por encima en SET y, con lotes grandes, en GET | ✅ |
+| Binario nativo a ~65–73% de Redis sin pipelining (el techo es del runtime: un servidor raylang vacío da ~200k); con pipelining por encima en SET y, con lotes grandes, en GET | ✅ |
 | Tests (parser incremental, actor, lotes, barrido de TTL, AOF, E2E con net/redis + pipelining + reinicio) | ✅ 17 |
 | Group commit: un volcado por tanda, respuesta después del volcado (`--fsync data\|full`) | ✅ |
 | Valores binarios en la AOF | ✅ (raylang M115.1: `fs.write_bytes`) |
