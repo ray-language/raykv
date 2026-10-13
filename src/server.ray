@@ -46,6 +46,8 @@ struct Conn {
     id: int,
     sv: Channel<store.Sv>,
     reply: Channel<bytes>,
+    // A batch comes back as unjoined chunks; this fiber joins them.
+    batch_reply: Channel<[bytes]>,
     // The pub/sub out channel exists from the start; a writer fiber drains it
     // only once the connection subscribes.
     pushes: Channel<bytes>,
@@ -62,6 +64,7 @@ fn serve_conn(h: int, conn_id: int, sv: Channel<store.Sv>) {
         id: conn_id,
         sv: sv,
         reply: Channel.bounded(1),
+        batch_reply: Channel.bounded(1),
         pushes: Channel.bounded(64),
         writer_running: false
     };
@@ -77,30 +80,72 @@ fn serve_conn(h: int, conn_id: int, sv: Channel<store.Sv>) {
                     break;
                 }
                 buf = buf + chunk;
-                // Every complete command in the buffer (pipelining).
+                // Every complete command in the buffer (pipelining), walked by
+                // offset. Plain commands go to the store as ONE batch: one
+                // round trip to the actor and one socket write per read
+                // instead of one per command.
+                var pos = 0;
+                var batch: [[bytes]] = [];
                 while (alive) {
-                    match (resp.parse(buf)) {
+                    match (resp.parse_at(buf, pos)) {
                         resp.Parsed.NeedMore => {
                             break;
                         },
                         resp.Parsed.Bad(e) => {
-                            net.socket_write_bytes(h, resp.error(e));
+                            if (flush_batch(c, batch)) {
+                                net.socket_write_bytes(h, resp.error(e));
+                            }
                             alive = false;
                         },
                         resp.Parsed.Cmd(args, used) => {
-                            buf = buf.sub_bytes(used, buf.len());
+                            pos = pos + used;
                             if (args.len() > 0) {
-                                alive = dispatch(c, args);
+                                if (is_plain(args)) {
+                                    batch.push(args);
+                                } else {
+                                    // Keep the reply order: the pending batch
+                                    // answers before this command does.
+                                    alive = flush_batch(c, batch) && dispatch(c, args);
+                                    batch = [];
+                                }
                             }
                         },
                     }
                 }
+                if (alive) {
+                    alive = flush_batch(c, batch);
+                }
+                buf = buf.sub_bytes(pos, buf.len());
             },
         }
     }
     send(sv, store.Sv.Gone(conn_id));
     close(c.pushes);
     close(h);
+}
+
+// Commands the connection handles itself (pub/sub, QUIT) are not batched.
+fn is_plain(args: [bytes]) -> bool {
+    let cmd = upper(args[0]);
+    !(cmd == "SUBSCRIBE" || cmd == "UNSUBSCRIBE" || cmd == "QUIT")
+}
+
+// Sends the pending plain commands as one batch and writes all their replies
+// at once; false when the connection must end.
+fn flush_batch(c: Conn, batch: [[bytes]]) -> bool {
+    if (batch.len() == 0) {
+        return true;
+    }
+    send(c.sv, store.Sv.Batch(batch, c.batch_reply));
+    match (recv(c.batch_reply)) {
+        Option.Some(parts) => {
+            if let Result.Err(e) = net.socket_write_bytes(c.h, resp.concat_all(parts)) {
+                return false;
+            }
+            true
+        },
+        Option.None => false,
+    }
 }
 
 // Runs one command and writes its reply; false when the connection must end.

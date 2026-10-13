@@ -2,6 +2,7 @@
 // commands, expiry, and AOF durability across a broker restart. One @test
 // (the runner leaves zombie listeners between tests).
 import std/fs;
+import std/net;
 import std/time;
 import net/redis;
 import aof;
@@ -40,7 +41,8 @@ fn raykv_end_to_end() {
         Result.Ok(d) => d,
         Result.Err(e) => panic(e),
     };
-    let c = conn(boot(dir));
+    let port = boot(dir);
+    let c = conn(port);
     assert_eq(cmd(c, ["PING"]), "PONG");
     assert_eq(cmd(c, ["SET", "saludo", "hola"]), "OK");
     assert_eq(cmd(c, ["GET", "saludo"]), "hola");
@@ -62,12 +64,40 @@ fn raykv_end_to_end() {
     assert_eq(cmd(c, ["TYPE", "saludo"]), "string");
     redis.close_conn(c);
 
+    // Pipelining over a raw socket: one write with several commands (a
+    // SUBSCRIBE in the middle splits the batch) gets every reply, in order.
+    let raw = match (net.tcp_connect("127.0.0.1", port)) {
+        Result.Ok(h) => h,
+        Result.Err(e) => panic(e),
+    };
+    net.socket_write(
+        raw,
+        "*3\r\n$3\r\nSET\r\n$2\r\np1\r\n$1\r\na\r\n*2\r\n$3\r\nGET\r\n$2\r\np1\r\n"
+            + "*2\r\n$9\r\nSUBSCRIBE\r\n$2\r\nch\r\n*1\r\n$4\r\nQUIT\r\n"
+    );
+    let want = "+OK\r\n$1\r\na\r\n*3\r\n$9\r\nsubscribe\r\n$2\r\nch\r\n:1\r\n+OK\r\n";
+    var got = b"";
+    while (got.len() < want.len()) {
+        match (net.socket_read_bytes(raw)) {
+            Result.Ok(chunk) => {
+                if (chunk.len() == 0) {
+                    break;
+                }
+                got = got + chunk;
+            },
+            Result.Err(e) => break,
+        }
+    }
+    assert_eq(from_utf8(got).unwrap_or("<binary>"), want);
+    close(raw);
+
     // Durability: a second store over the same dir (fresh port) sees the data.
     let c2 = conn(boot(dir));
     assert_eq(cmd(c2, ["GET", "saludo"]), "hola");
     assert_eq(cmd(c2, ["GET", "visitas"]), "11");
     assert_eq(cmd(c2, ["GET", "fugaz"]), "(nil)");
-    assert_eq(cmd(c2, ["DBSIZE"]), "2");
+    assert_eq(cmd(c2, ["GET", "p1"]), "a");
+    assert_eq(cmd(c2, ["DBSIZE"]), "3");
     redis.close_conn(c2);
     fs.remove_all(dir);
 }

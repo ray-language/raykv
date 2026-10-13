@@ -16,6 +16,9 @@ struct Entry {
 
 pub enum Sv {
     Cmd([bytes], Channel<bytes>),
+    // Every command parsed from one socket read (pipelining): one round trip
+    // and one reply holding all the answers, in order.
+    Batch([[bytes]], Channel<[bytes]>),
     Subscribe(int, string, Channel<bytes>, Channel<bytes>),
     Unsubscribe(int, string, Channel<bytes>),
     Gone(int),
@@ -27,8 +30,17 @@ struct Subscriber {
     out: Channel<bytes>,
 }
 
+// Bulk headers kept ready-made for values shorter than this (GET replies).
+const BULK_HEADERS: int = 4096;
+
 struct Store {
     data: Map<string, Entry>,
+    // Keys with a TTL and their deadline, so the periodic sweep walks only
+    // those instead of the whole keyspace. Kept in step by put/drop_key.
+    expiring: Map<string, int>,
+    // "$<n>\r\n" for n in 0..BULK_HEADERS, built once: a GET reply does not
+    // format its length.
+    headers: [bytes],
     subs: Map<string, [Subscriber]>,
     log: aof.Aof,
     persist: bool,
@@ -50,7 +62,24 @@ pub fn start(dir: string, persist: bool, fsync: aof.Fsync) -> Result<Channel<Sv>
         }
         log = aof.rewrite_and_open(path, dump_commands(data), fsync)?;
     }
-    let st = Store { data: data, subs: subs, log: log, persist: persist };
+    var expiring: Map<string, int> = Map.new();
+    for (k, e) in data {
+        if (e.expires_at > 0) {
+            expiring.insert(k, e.expires_at);
+        }
+    }
+    var headers: [bytes] = [];
+    for n in 0..BULK_HEADERS {
+        headers.push(("$" + to_string(n) + "\r\n").to_bytes());
+    }
+    let st = Store {
+        data: data,
+        expiring: expiring,
+        headers: headers,
+        subs: subs,
+        log: log,
+        persist: persist
+    };
     spawn(fn() {
         actor_loop(ch, st);
     });
@@ -123,12 +152,28 @@ fn apply_only(data: Map<string, Entry>, args: [bytes]) {
     }
 }
 
+// Every write to the keyspace goes through put/drop_key, which keep the TTL
+// index in step with the data.
+fn put(st: Store, k: string, e: Entry) {
+    st.data.insert(k, e);
+    if (e.expires_at > 0) {
+        st.expiring.insert(k, e.expires_at);
+    } else {
+        st.expiring.remove(k);
+    }
+}
+
+fn drop_key(st: Store, k: string) {
+    st.data.remove(k);
+    st.expiring.remove(k);
+}
+
 // Live read with lazy expiry.
 fn live(st: Store, k: string) -> Option<Entry> {
     match (get(st.data, k)) {
         Option.Some(e) => {
             if (e.expires_at > 0 && e.expires_at <= now_ms()) {
-                st.data.remove(k);
+                drop_key(st, k);
                 if (st.persist) {
                     aof.append(st.log, [b"DEL", k.to_bytes()]);
                 }
@@ -223,9 +268,9 @@ fn set_cmd(st: Store, args: [bytes]) -> bytes {
     if (nx && exists || xx && !exists) {
         return resp.nil();
     }
-    st.data.insert(k, Entry { value: args[2], expires_at: expires_at });
+    put(st, k, Entry { value: args[2], expires_at: expires_at });
     log_set(st, k, args[2], expires_at);
-    resp.simple("OK")
+    resp.OK
 }
 
 fn incr_by(st: Store, k: string, delta: int) -> bytes {
@@ -254,7 +299,7 @@ fn incr_by(st: Store, k: string, delta: int) -> bytes {
     }
     let next = cur + delta;
     let v = to_string(next).to_bytes();
-    st.data.insert(k, Entry { value: v, expires_at: expires_at });
+    put(st, k, Entry { value: v, expires_at: expires_at });
     log_set(st, k, v, expires_at);
     resp.integer(next)
 }
@@ -271,7 +316,7 @@ fn expire_cmd(st: Store, args: [bytes], unit_ms: int, absolute: bool) -> bytes {
                 Option.None => resp.integer(0),
                 Option.Some(e) => {
                     let at = if (absolute) { n } else { now_ms() + n * unit_ms };
-                    st.data.insert(k, Entry { value: e.value, expires_at: at });
+                    put(st, k, Entry { value: e.value, expires_at: at });
                     if (st.persist) {
                         aof.append(st.log, [b"PEXPIREAT", k.to_bytes(), to_string(at).to_bytes()]);
                     }
@@ -327,6 +372,48 @@ fn drop_conn(st: Store, conn_id: int) {
     }
 }
 
+// Whether b spells word (ASCII uppercase) in any case, without allocating.
+fn upper_is(b: bytes, word: string) -> bool {
+    let w = word.to_bytes();
+    if (b.len() != w.len()) {
+        return false;
+    }
+    var i = 0;
+    while (i < b.len()) {
+        var c = b[i];
+        if (c >= 97 && c <= 122) {
+            c = c - 32;
+        }
+        if (c != w[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+// Appends the reply to parts. GET, the hot read, pushes header, value and
+// CRLF as separate chunks: concat_all joins the whole batch once.
+fn execute_into(st: Store, args: [bytes], parts: [bytes]) {
+    if (args.len() == 2 && upper_is(args[0], "GET")) {
+        match (live(st, arg_str(args, 1))) {
+            Option.Some(e) => {
+                let n = e.value.len();
+                parts.push(
+                    if (n < st.headers.len()) { st.headers[n] } else { resp.bulk_header(n) }
+                );
+                parts.push(e.value);
+                parts.push(resp.CRLF);
+            },
+            Option.None => {
+                parts.push(resp.nil());
+            },
+        }
+        return;
+    }
+    parts.push(execute(st, args));
+}
+
 pub fn execute(st: Store, args: [bytes]) -> bytes {
     if (args.len() == 0) {
         return resp.error("empty command");
@@ -353,7 +440,7 @@ pub fn execute(st: Store, args: [bytes]) -> bytes {
             let k = arg_str(args, i);
             match (live(st, k)) {
                 Option.Some(e) => {
-                    st.data.remove(k);
+                    drop_key(st, k);
                     n = n + 1;
                     if (st.persist) {
                         aof.append(st.log, [b"DEL", k.to_bytes()]);
@@ -428,7 +515,7 @@ pub fn execute(st: Store, args: [bytes]) -> bytes {
         resp.integer(st.data.len())
     } else if (cmd == "FLUSHALL" || cmd == "FLUSHDB") {
         for k in st.data.keys() {
-            st.data.remove(k);
+            drop_key(st, k);
         }
         if (st.persist) {
             aof.append(st.log, [b"FLUSHALL"]);
@@ -455,13 +542,13 @@ pub fn execute(st: Store, args: [bytes]) -> bytes {
 fn sweep(st: Store) {
     let t = now_ms();
     var doomed: [string] = [];
-    for (k, e) in st.data {
-        if (e.expires_at > 0 && e.expires_at <= t) {
+    for (k, at) in st.expiring {
+        if (at <= t) {
             doomed.push(k);
         }
     }
     for k in doomed {
-        st.data.remove(k);
+        drop_key(st, k);
         if (st.persist) {
             aof.append(st.log, [b"DEL", k.to_bytes()]);
         }
@@ -474,6 +561,18 @@ fn sweep(st: Store) {
 // queue fills while the actor syncs, and one sync covers many writes.
 const MAX_BATCH: int = 256;
 
+// Bytes up to which a batch reply is joined by the actor itself.
+const JOIN_IN_ACTOR: int = 2048;
+
+// The replies of one actor batch, held until the AOF flush. A Batch answers
+// with its chunks unjoined: the connection fiber joins them, off the actor.
+struct Out {
+    replies: [Channel<bytes>],
+    frames: [bytes],
+    batch_replies: [Channel<[bytes]>],
+    batch_parts: [[bytes]],
+}
+
 fn actor_loop(ch: Channel<Sv>, st: Store) {
     while (true) {
         match (recv(ch)) {
@@ -481,14 +580,13 @@ fn actor_loop(ch: Channel<Sv>, st: Store) {
                 break;
             },
             Option.Some(first) => {
-                var replies: [Channel<bytes>] = [];
-                var frames: [bytes] = [];
-                handle(st, first, replies, frames);
+                var out = Out { replies: [], frames: [], batch_replies: [], batch_parts: [] };
+                handle(st, first, out);
                 var n = 1;
                 while (n < MAX_BATCH) {
                     match (try_recv(ch)) {
                         Received.Got(msg) => {
-                            handle(st, msg, replies, frames);
+                            handle(st, msg, out);
                             n = n + 1;
                         },
                         _ => {
@@ -498,8 +596,13 @@ fn actor_loop(ch: Channel<Sv>, st: Store) {
                 }
                 aof.flush(st.log);
                 var i = 0;
-                while (i < replies.len()) {
-                    send(replies[i], frames[i]);
+                while (i < out.replies.len()) {
+                    send(out.replies[i], out.frames[i]);
+                    i = i + 1;
+                }
+                i = 0;
+                while (i < out.batch_replies.len()) {
+                    send(out.batch_replies[i], out.batch_parts[i]);
                     i = i + 1;
                 }
             },
@@ -507,13 +610,31 @@ fn actor_loop(ch: Channel<Sv>, st: Store) {
     }
 }
 
-// Applies one message. Command replies are held in replies/frames until the
-// batch is flushed; pub/sub acks write nothing to the AOF and go out at once.
-fn handle(st: Store, msg: Sv, replies: [Channel<bytes>], frames: [bytes]) {
+// Applies one message. Command replies are held in out until the batch is
+// flushed; pub/sub acks write nothing to the AOF and go out at once.
+fn handle(st: Store, msg: Sv, out: Out) {
     match (msg) {
         Sv.Cmd(args, reply) => {
-            replies.push(reply);
-            frames.push(execute(st, args));
+            out.replies.push(reply);
+            out.frames.push(execute(st, args));
+        },
+        Sv.Batch(cmds, reply) => {
+            var parts: [bytes] = [];
+            for args in cmds {
+                execute_into(st, args, parts);
+            }
+            out.batch_replies.push(reply);
+            // A small reply is cheaper to join here than to ship as chunks; a
+            // big one is joined by the connection fiber, off the actor.
+            var size = 0;
+            for p in parts {
+                size = size + p.len();
+            }
+            if (size <= JOIN_IN_ACTOR) {
+                out.batch_parts.push([resp.concat_all(parts)]);
+            } else {
+                out.batch_parts.push(parts);
+            }
         },
         Sv.Subscribe(conn_id, channel, out, reply) => {
             var fresh: [Subscriber] = [];
