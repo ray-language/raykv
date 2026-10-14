@@ -139,7 +139,7 @@ fn flush_batch(c: Conn, batch: [[bytes]]) -> bool {
     send(c.sv, store.Sv.Batch(batch, c.batch_reply));
     match (recv(c.batch_reply)) {
         Option.Some(parts) => {
-            if let Result.Err(e) = net.socket_write_bytes(c.h, resp.concat_all(parts)) {
+            if let Result.Err(e) = net.socket_write_bytes(c.h, bytes_concat(parts)) {
                 return false;
             }
             true

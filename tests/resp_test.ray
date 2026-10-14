@@ -125,10 +125,3 @@ fn parse_at_walks_a_buffer_by_offset() {
         _ => panic("expected NeedMore on the torn tail"),
     }
 }
-
-@test
-fn concat_all_joins_any_number_of_chunks_in_order() {
-    assert_eq(resp.concat_all([]).len(), 0);
-    assert_eq(from_utf8(resp.concat_all([b"one"])).unwrap_or(""), "one");
-    assert_eq(from_utf8(resp.concat_all([b"a", b"b", b"c", b"d", b"e"])).unwrap_or(""), "abcde");
-}

@@ -393,7 +393,7 @@ fn upper_is(b: bytes, word: string) -> bool {
 }
 
 // Appends the reply to parts. GET, the hot read, pushes header, value and
-// CRLF as separate chunks: concat_all joins the whole batch once.
+// CRLF as separate chunks: bytes_concat joins the whole batch once.
 fn execute_into(st: Store, args: [bytes], parts: [bytes]) {
     if (args.len() == 2 && upper_is(args[0], "GET")) {
         match (live(st, arg_str(args, 1))) {
@@ -631,7 +631,7 @@ fn handle(st: Store, msg: Sv, out: Out) {
                 size = size + p.len();
             }
             if (size <= JOIN_IN_ACTOR) {
-                out.batch_parts.push([resp.concat_all(parts)]);
+                out.batch_parts.push([bytes_concat(parts)]);
             } else {
                 out.batch_parts.push(parts);
             }
