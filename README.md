@@ -138,7 +138,9 @@ siempre por `fs.sync` antes del rename.
 
 - **Parser RESP2 incremental y binario-seguro** (`src/resp.ray`): consume de
   un buffer creciente y devuelve un comando por llamada o `NeedMore` con el
-  frame partido por TCP; comandos inline (`PING\r\n`) incluidos.
+  frame partido por TCP; comandos inline (`PING\r\n`) incluidos. Una línea inline que empieza
+  por `POST` o `Host:` es una petición HTTP (una página web apuntando al puerto): error y se
+  cierra la conexión, como hace Redis.
 - **Un actor dueño del keyspace** (como Redis: single-threaded donde importa):
   cada conexión es una fibra que parsea y serializa sus comandos por canal.
   Pub/sub: el actor guarda los canales de salida de los suscriptores; una
