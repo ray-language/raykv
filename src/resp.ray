@@ -49,6 +49,15 @@ fn parse_int_bytes(buf: bytes, start: int, end: int) -> Option<int> {
     if (neg) { Option.Some(-v) } else { Option.Some(v) }
 }
 
+// A web page can POST to this port and, since inline commands are accepted,
+// the lines of its body would run as commands (Redis "Cross Protocol
+// Scripting", fixed in 3.2.7). An inline line starting with POST or Host:
+// is an HTTP request, never a command: the connection is closed.
+fn looks_like_http(line: string) -> bool {
+    let l = line.trim().to_lower();
+    l.starts_with("post ") || l.starts_with("host:")
+}
+
 // One command from buf[0..): Cmd(args, consumed) | NeedMore | Bad.
 pub fn parse(buf: bytes) -> Parsed {
     parse_at(buf, 0)
@@ -74,6 +83,9 @@ pub fn parse_at(buf: bytes, start: int) -> Parsed {
                 match (from_utf8(buf.sub_bytes(start, e))) {
                     Result.Err(err) => Parsed.Bad("invalid inline command"),
                     Result.Ok(line) => {
+                        if (looks_like_http(line)) {
+                            return Parsed.Bad("cross-protocol request (HTTP), closing");
+                        }
                         var out: [bytes] = [];
                         for part in line.split(" ") {
                             if (part.trim() != "") {
