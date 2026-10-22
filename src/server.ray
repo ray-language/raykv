@@ -40,6 +40,15 @@ fn arg_str(args: [bytes], i: int) -> string {
     from_utf8(args[i]).unwrap_or("")
 }
 
+fn all_text(args: [bytes]) -> bool {
+    for a in args {
+        if let Result.Err(e) = from_utf8(a) {
+            return false;
+        }
+    }
+    true
+}
+
 // Per-connection state shared by the read loop and the command dispatcher.
 struct Conn {
     h: int,
@@ -152,7 +161,9 @@ fn flush_batch(c: Conn, batch: [[bytes]]) -> bool {
 fn dispatch(c: Conn, args: [bytes]) -> bool {
     let cmd = upper(args[0]);
     var out = b"";
-    if (cmd == "SUBSCRIBE" && args.len() >= 2) {
+    if ((cmd == "SUBSCRIBE" || cmd == "UNSUBSCRIBE") && !all_text(args)) {
+        out = resp.error("keys and channels must be UTF-8");
+    } else if (cmd == "SUBSCRIBE" && args.len() >= 2) {
         for i in 1..args.len() {
             send(c.sv, store.Sv.Subscribe(c.id, arg_str(args, i), c.pushes, c.reply));
             if let Option.Some(r) = recv(c.reply) {
