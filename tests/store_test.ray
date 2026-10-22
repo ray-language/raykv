@@ -85,3 +85,34 @@ fn a_batch_of_reads_returns_every_value_whole() {
     let got = from_utf8(bytes_concat(recv(reply).expect("store gone"))).expect("utf8");
     assert_eq(got, "$3000\r\n" + big + "\r\n$-1\r\n$1\r\ns\r\n");
 }
+
+@test
+fn out_of_range_expiries_and_increments_are_errors() {
+    let sv = start();
+    let max = "9223372036854775807";
+    assert_eq(call(sv, ["SET", "a", "v", "EX", max]).starts_with("-ERR"), true);
+    assert_eq(call(sv, ["SET", "a", "v", "PX", "0"]).starts_with("-ERR"), true);
+    assert_eq(call(sv, ["SET", "n", max]), "+OK\r\n");
+    assert_eq(call(sv, ["INCR", "n"]).starts_with("-ERR"), true);
+    assert_eq(call(sv, ["SET", "m", "-" + max]), "+OK\r\n");
+    assert_eq(call(sv, ["DECR", "m"]), ":-9223372036854775808\r\n");
+    assert_eq(call(sv, ["DECR", "m"]).starts_with("-ERR"), true);
+    assert_eq(call(sv, ["PEXPIRE", "n", max]).starts_with("-ERR"), true);
+    // A deadline in the past expires the key; it does not make it permanent.
+    assert_eq(call(sv, ["PEXPIREAT", "n", "-5"]), ":1\r\n");
+    assert_eq(call(sv, ["GET", "n"]), "$-1\r\n");
+    assert_eq(call(sv, ["PING"]), "+PONG\r\n");
+}
+
+@test
+fn keys_globs_without_backtracking() {
+    let sv = start();
+    call(sv, ["SET", "a".repeat(40), "v"]);
+    call(sv, ["SET", "hello", "v"]);
+    let t0 = time.now();
+    assert_eq(call(sv, ["KEYS", "*a".repeat(12) + "b"]), "*0\r\n");
+    assert_eq(time.now() - t0 < 500, true);
+    assert_eq(call(sv, ["KEYS", "h?l*o"]), "*1\r\n$5\r\nhello\r\n");
+    assert_eq(call(sv, ["KEYS", "*l"]), "*0\r\n");
+    assert_eq(call(sv, ["KEYS", "**"]).starts_with("*2"), true);
+}
