@@ -152,3 +152,19 @@ fn error_and_status_lines_stay_one_line() {
     assert_eq(resp.error("a\r\nb"), b"-ERR a  b\r\n");
     assert_eq(resp.simple("x\ny"), b"+x y\r\n");
 }
+
+@test
+fn an_http_request_is_refused_as_a_command() {
+    match (resp.parse(b"POST / HTTP/1.1\r\nHost: x\r\n\r\nSET a b\r\n")) {
+        resp.Parsed.Bad(e) => assert(e.contains("cross-protocol")),
+        _ => panic("POST parsed as a command"),
+    }
+    match (resp.parse(b"Host: 127.0.0.1\r\n")) {
+        resp.Parsed.Bad(e) => assert(e.contains("cross-protocol")),
+        _ => panic("Host: parsed as a command"),
+    }
+    match (resp.parse(b"PING\r\n")) {
+        resp.Parsed.Cmd(args, used) => assert_eq(args.len(), 1),
+        _ => panic("PING inline must still parse"),
+    }
+}
