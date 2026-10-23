@@ -17,6 +17,13 @@ fn find_crlf(buf: bytes, start: int) -> Option<int> {
     buf.index_of_from(b"\r\n", start)
 }
 
+// The longest *N / $N header line accepted: a sign and 19 digits.
+const MAX_LEN_LINE: int = 20;
+
+const INT_MAX: int = 9223372036854775807;
+
+// Digits outside the int range are None, not an overflow: the caller turns
+// them into an error reply.
 fn parse_int_bytes(buf: bytes, start: int, end: int) -> Option<int> {
     var v = 0;
     var i = start;
@@ -31,6 +38,9 @@ fn parse_int_bytes(buf: bytes, start: int, end: int) -> Option<int> {
     while (i < end) {
         let d = buf[i];
         if (d < 48 || d > 57) {
+            return Option.None;
+        }
+        if (v > (INT_MAX - (d - 48)) / 10) {
             return Option.None;
         }
         v = v * 10 + (d - 48);
@@ -79,9 +89,15 @@ pub fn parse_at(buf: bytes, start: int) -> Parsed {
         let head_end = match (find_crlf(buf, start + 1)) {
             Option.Some(e) => e,
             Option.None => {
+                if (buf.len() - start > MAX_LEN_LINE + 1) {
+                    return Parsed.Bad("invalid multibulk length");
+                }
                 return Parsed.NeedMore;
             },
         };
+        if (head_end - start > MAX_LEN_LINE + 1) {
+            return Parsed.Bad("invalid multibulk length");
+        }
         let n = match (parse_int_bytes(buf, start + 1, head_end)) {
             Option.Some(v) => v,
             Option.None => {
@@ -104,9 +120,15 @@ pub fn parse_at(buf: bytes, start: int) -> Parsed {
             let lend = match (find_crlf(buf, pos + 1)) {
                 Option.Some(e) => e,
                 Option.None => {
+                    if (buf.len() - pos > MAX_LEN_LINE + 1) {
+                        return Parsed.Bad("invalid bulk length");
+                    }
                     return Parsed.NeedMore;
                 },
             };
+            if (lend - pos > MAX_LEN_LINE + 1) {
+                return Parsed.Bad("invalid bulk length");
+            }
             let blen = match (parse_int_bytes(buf, pos + 1, lend)) {
                 Option.Some(v) => v,
                 Option.None => {
@@ -139,12 +161,18 @@ pub fn bulk_header(n: int) -> bytes {
     ("$" + to_string(n) + "\r\n").to_bytes()
 }
 
+// A status or error line must stay one line: CR and LF in the text (an
+// echoed command name, say) would let it forge a second reply.
+fn one_line(s: string) -> string {
+    s.replace("\r", " ").replace("\n", " ")
+}
+
 pub fn simple(s: string) -> bytes {
-    ("+" + s + "\r\n").to_bytes()
+    ("+" + one_line(s) + "\r\n").to_bytes()
 }
 
 pub fn error(s: string) -> bytes {
-    ("-ERR " + s + "\r\n").to_bytes()
+    ("-ERR " + one_line(s) + "\r\n").to_bytes()
 }
 
 pub fn integer(n: int) -> bytes {

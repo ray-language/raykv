@@ -195,29 +195,72 @@ fn log_set(st: Store, k: string, v: bytes, expires_at: int) {
     }
 }
 
+// '*' and '?' globbing in O(len(p) * len(s)): on a mismatch only the last
+// star is retried, one character further, so no pattern backtracks
+// exponentially (this runs on the actor, where a slow KEYS stalls everyone).
 fn glob_match(pattern: string, s: string) -> bool {
-    glob_at(pattern.chars(), 0, s.chars(), 0)
+    let p = pattern.chars();
+    let t = s.chars();
+    var pi = 0;
+    var ti = 0;
+    var star = -1;
+    var mark = 0;
+    while (ti < t.len()) {
+        if (pi < p.len() && (p[pi] == '?' || p[pi] != '*' && p[pi] == t[ti])) {
+            pi = pi + 1;
+            ti = ti + 1;
+        } else if (pi < p.len() && p[pi] == '*') {
+            star = pi;
+            mark = ti;
+            pi = pi + 1;
+        } else if (star >= 0) {
+            pi = star + 1;
+            mark = mark + 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    while (pi < p.len() && p[pi] == '*') {
+        pi = pi + 1;
+    }
+    pi == p.len()
 }
 
-fn glob_at(p: [char], pi: int, s: [char], si: int) -> bool {
-    if (pi >= p.len()) {
-        return si >= s.len();
+const INT_MAX: int = 9223372036854775807;
+
+// The largest TTL span in ms (about 146 million years): now plus or minus
+// this never leaves the int range, and neither does TTL's rounding.
+const MAX_SPAN_MS: int = 4611686018427387903;
+
+// The deadline n units from now, or None when n * unit_ms is out of range.
+// A deadline in the past is clamped to 1 ms after the epoch: 0 means "no
+// expiry", so it must not be reached by accident.
+fn deadline(n: int, unit_ms: int) -> Option<int> {
+    let lim = MAX_SPAN_MS / unit_ms;
+    if (n > lim || n < -lim) {
+        return Option.None;
     }
-    let c = p[pi];
-    if (c == '*') {
-        var k = si;
-        while (k <= s.len()) {
-            if (glob_at(p, pi + 1, s, k)) {
-                return true;
+    let at = now_ms() + n * unit_ms;
+    Option.Some(if (at < 1) { 1 } else { at })
+}
+
+// Whether every argument that names a key or a channel is UTF-8. Values
+// (SET's and PUBLISH's payload, ECHO's and PING's text) may be any bytes;
+// a key that is not UTF-8 would decode to "" and alias every other such key.
+fn keys_are_text(cmd: string, args: [bytes]) -> bool {
+    var i = 1;
+    while (i < args.len()) {
+        let payload = (cmd == "SET" || cmd == "PUBLISH") && i == 2
+            || (cmd == "ECHO" || cmd == "PING") && i == 1;
+        if (!payload) {
+            if let Result.Err(e) = from_utf8(args[i]) {
+                return false;
             }
-            k = k + 1;
         }
-        false
-    } else if (c == '?') {
-        si < s.len() && glob_at(p, pi + 1, s, si + 1)
-    } else {
-        si < s.len() && s[si] == c && glob_at(p, pi + 1, s, si + 1)
+        i = i + 1;
     }
+    true
 }
 
 fn set_cmd(st: Store, args: [bytes]) -> bytes {
@@ -234,7 +277,17 @@ fn set_cmd(st: Store, args: [bytes]) -> bytes {
         if (opt == "EX" && i + 1 < args.len()) {
             match (arg_int(args, i + 1)) {
                 Option.Some(secs) => {
-                    expires_at = now_ms() + secs * 1000;
+                    if (secs <= 0) {
+                        return resp.error("invalid expire time in 'set' command");
+                    }
+                    match (deadline(secs, 1000)) {
+                        Option.Some(at) => {
+                            expires_at = at;
+                        },
+                        Option.None => {
+                            return resp.error("invalid expire time in 'set' command");
+                        },
+                    }
                 },
                 Option.None => {
                     return resp.error("value is not an integer or out of range");
@@ -244,7 +297,17 @@ fn set_cmd(st: Store, args: [bytes]) -> bytes {
         } else if (opt == "PX" && i + 1 < args.len()) {
             match (arg_int(args, i + 1)) {
                 Option.Some(ms) => {
-                    expires_at = now_ms() + ms;
+                    if (ms <= 0) {
+                        return resp.error("invalid expire time in 'set' command");
+                    }
+                    match (deadline(ms, 1)) {
+                        Option.Some(at) => {
+                            expires_at = at;
+                        },
+                        Option.None => {
+                            return resp.error("invalid expire time in 'set' command");
+                        },
+                    }
                 },
                 Option.None => {
                     return resp.error("value is not an integer or out of range");
@@ -297,6 +360,9 @@ fn incr_by(st: Store, k: string, delta: int) -> bytes {
         },
         Option.None => { },
     }
+    if (delta > 0 && cur > INT_MAX - delta || delta < 0 && cur < -INT_MAX - 1 - delta) {
+        return resp.error("increment or decrement would overflow");
+    }
     let next = cur + delta;
     let v = to_string(next).to_bytes();
     put(st, k, Entry { value: v, expires_at: expires_at });
@@ -315,7 +381,16 @@ fn expire_cmd(st: Store, args: [bytes], unit_ms: int, absolute: bool) -> bytes {
             match (live(st, k)) {
                 Option.None => resp.integer(0),
                 Option.Some(e) => {
-                    let at = if (absolute) { n } else { now_ms() + n * unit_ms };
+                    let at = if (absolute) {
+                        if (n < 1) { 1 } else if (n > MAX_SPAN_MS) { MAX_SPAN_MS } else { n }
+                    } else {
+                        match (deadline(n, unit_ms)) {
+                            Option.Some(d) => d,
+                            Option.None => {
+                                return resp.error("invalid expire time");
+                            },
+                        }
+                    };
                     put(st, k, Entry { value: e.value, expires_at: at });
                     if (st.persist) {
                         aof.append(st.log, [b"PEXPIREAT", k.to_bytes(), to_string(at).to_bytes()]);
@@ -395,7 +470,7 @@ fn upper_is(b: bytes, word: string) -> bool {
 // Appends the reply to parts. GET, the hot read, pushes header, value and
 // CRLF as separate chunks: bytes_concat joins the whole batch once.
 fn execute_into(st: Store, args: [bytes], parts: [bytes]) {
-    if (args.len() == 2 && upper_is(args[0], "GET")) {
+    if (args.len() == 2 && upper_is(args[0], "GET") && keys_are_text("GET", args)) {
         match (live(st, arg_str(args, 1))) {
             Option.Some(e) => {
                 let n = e.value.len();
@@ -419,6 +494,9 @@ pub fn execute(st: Store, args: [bytes]) -> bytes {
         return resp.error("empty command");
     }
     let cmd = arg_str(args, 0).to_upper();
+    if (!keys_are_text(cmd, args)) {
+        return resp.error("keys and channels must be UTF-8");
+    }
     if (cmd == "PING") {
         if (args.len() > 1) { resp.bulk(args[1]) } else { resp.simple("PONG") }
     } else if (cmd == "ECHO" && args.len() >= 2) {

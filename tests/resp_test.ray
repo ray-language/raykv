@@ -125,3 +125,30 @@ fn parse_at_walks_a_buffer_by_offset() {
         _ => panic("expected NeedMore on the torn tail"),
     }
 }
+
+fn expect_bad(buf: bytes) {
+    match (resp.parse(buf)) {
+        resp.Parsed.Bad(e) => { },
+        resp.Parsed.Cmd(a, u) => panic("expected Bad, got a command"),
+        resp.Parsed.NeedMore => panic("expected Bad, got NeedMore"),
+    }
+}
+
+@test
+fn lengths_out_of_the_int_range_are_bad_not_an_overflow() {
+    expect_bad(b"*99999999999999999999\r\n");
+    expect_bad(b"*1\r\n$99999999999999999999\r\n");
+}
+
+@test
+fn a_length_line_without_an_end_is_bad_once_it_is_too_long() {
+    expect_need_more(b"*1\r\n$12");
+    expect_bad(("*1\r\n$" + "9".repeat(64)).to_bytes());
+    expect_bad(("*" + "9".repeat(64)).to_bytes());
+}
+
+@test
+fn error_and_status_lines_stay_one_line() {
+    assert_eq(resp.error("a\r\nb"), b"-ERR a  b\r\n");
+    assert_eq(resp.simple("x\ny"), b"+x y\r\n");
+}
